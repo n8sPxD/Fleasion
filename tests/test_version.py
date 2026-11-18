@@ -8,7 +8,7 @@ from fleasion.utils.metadata import APP_REPO
 
 
 def test_repository_url_comes_from_distribution_metadata() -> None:
-    assert APP_REPO == 'https://github.com/fleasion/Fleasion'
+    assert APP_REPO == 'https://github.com/n8sPxD/Fleasion'
 
 
 @pytest.mark.parametrize('app_version', ['2.4.0', '2.4.0.post1'])

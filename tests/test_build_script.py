@@ -61,6 +61,23 @@ def test_packaging_collects_lz4_native_extensions() -> None:
     assert "_collect_package('lz4')" in spec_source
 
 
+def test_packaging_keeps_http2_runtime() -> None:
+    spec_path = Path(__file__).resolve().parents[1] / 'Fleasion.spec'
+    spec_source = spec_path.read_text(encoding='utf-8')
+
+    assert "'h2'," not in spec_source
+    assert "'hyperframe'," not in spec_source
+
+
+def test_windows_package_uses_system_icu() -> None:
+    spec_path = Path(__file__).resolve().parents[1] / 'Fleasion.spec'
+    spec_source = spec_path.read_text(encoding='utf-8')
+
+    assert '_EXTERNAL_WINDOWS_ICU_RUNTIME_NAMES' in spec_source
+    assert "'icuuc.dll'" in spec_source
+    assert "'icudt78.dll'" in spec_source
+
+
 def _set_reproducible_environment(monkeypatch: MonkeyPatch) -> None:
     for name, value in build.REPRODUCIBLE_ENV.items():
         monkeypatch.setenv(name, value)

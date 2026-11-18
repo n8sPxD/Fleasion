@@ -37,9 +37,9 @@ dependencies = [
 ]
 
 [project.urls]
-Repository = 'https://github.com/fleasion/Fleasion'
-Issues = 'https://github.com/fleasion/Fleasion/issues'
-Releases = 'https://github.com/fleasion/Fleasion/releases'
+Repository = 'https://github.com/n8sPxD/Fleasion'
+Issues = 'https://github.com/n8sPxD/Fleasion/issues'
+Releases = 'https://github.com/n8sPxD/Fleasion/releases'
 
 [project.scripts]
 fleasion = 'fleasion:main'

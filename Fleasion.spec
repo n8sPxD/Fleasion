@@ -66,8 +66,6 @@ _BASE_EXCLUDES = [
     'mitmproxy',  # removed - replaced by proxy/server.py
     'mitmproxy_rs',  # removed
     'wsproto',  # mitmproxy dep, no longer needed
-    'h2',  # mitmproxy dep, no longer needed
-    'hyperframe',  # mitmproxy dep, no longer needed
 ]
 
 _NUMPY_EXCLUDES = [
@@ -144,6 +142,7 @@ _UNUSED_QT_RUNTIME_NAMES = {
     'libqtiff.dylib',
     'QtPdf.framework',
 }
+_EXTERNAL_WINDOWS_ICU_RUNTIME_NAMES = {'icuuc.dll', 'icudt78.dll'}
 
 _UNUSED_QT_RUNTIME_PATH_PARTS = (
     '/PyQt6/Qt6/translations/',
@@ -258,9 +257,7 @@ if sys.platform == 'win32':
 elif sys.platform.startswith('linux'):
     _exe_name = f'{_exe_name}-Linux'
 _macos_target_arch = (
-    os.environ.get('MACOS_TARGET_ARCH', 'universal2')
-    if sys.platform == 'darwin'
-    else None
+    os.environ.get('MACOS_TARGET_ARCH', 'universal2') if sys.platform == 'darwin' else None
 )
 # Keep UPX's size savings for the Windows one-file build, but leave the native
 # Qt/PyQt graphics stack byte-for-byte as shipped by its wheels. The dashboard
@@ -333,9 +330,7 @@ elif sys.platform == 'darwin':
         if _macos_target_arch in _bundled_macos_helpers
         else list(_bundled_macos_helpers.values())
     )
-    _existing_macos_helpers = [
-        helper for helper in _wanted_macos_helpers if helper.exists()
-    ]
+    _existing_macos_helpers = [helper for helper in _wanted_macos_helpers if helper.exists()]
     if not _existing_macos_helpers and _bundled_legacy_macos_helper.exists():
         _existing_macos_helpers = [_bundled_legacy_macos_helper]
     if not _existing_macos_helpers:
@@ -372,6 +367,14 @@ a = Analysis(
 )
 
 a.binaries = _drop_entries(a.binaries, _is_unused_qt_runtime_entry)
+if sys.platform == 'win32':
+    # Qt uses the Windows system ICU. Dependency scanning may otherwise pick an
+    # incompatible ICU build from a developer tool's PATH and place it at the
+    # archive root, where it shadows the operating-system DLL.
+    a.binaries = _drop_entries(
+        a.binaries,
+        lambda entry: _entry_name_matches(entry, _EXTERNAL_WINDOWS_ICU_RUNTIME_NAMES),
+    )
 a.datas = _drop_entries(a.datas, _is_unused_qt_runtime_entry)
 if sys.platform.startswith('linux'):
     # The sounddevice hook and dependency scan can collect the build machine's

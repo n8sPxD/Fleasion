@@ -9,9 +9,9 @@ from fleasion.utils.metadata import APP_REPO
 from fleasion.utils.update_resolver import ReleaseCandidate, UpdateResolver
 from fleasion.utils.updater import QtUpdateChecker
 
-_REPOSITORY_URL = 'https://github.com/fleasion/Fleasion'
-_LATEST_RELEASE_API = 'https://api.github.com/repos/fleasion/Fleasion/releases/latest'
-_RELEASES_API = 'https://api.github.com/repos/fleasion/Fleasion/releases'
+_REPOSITORY_URL = 'https://github.com/n8sPxD/Fleasion'
+_LATEST_RELEASE_API = 'https://api.github.com/repos/n8sPxD/Fleasion/releases/latest'
+_RELEASES_API = 'https://api.github.com/repos/n8sPxD/Fleasion/releases'
 
 
 def _resolver(current_version: str) -> UpdateResolver:
@@ -81,8 +81,8 @@ def test_resolver_caches_parsed_configuration(monkeypatch: MonkeyPatch) -> None:
     resolver = _resolver('2.4.0b1')
 
     assert resolver.parsed_current_version is resolver.parsed_current_version
-    assert resolver.repository_slug == 'fleasion/Fleasion'
-    assert resolver.releases_page.endswith('/fleasion/Fleasion/releases/latest')
+    assert resolver.repository_slug == 'n8sPxD/Fleasion'
+    assert resolver.releases_page.endswith('/n8sPxD/Fleasion/releases/latest')
     assert resolver.release_api == _RELEASES_API
     assert resolver.parsed_repository_url is resolver.parsed_repository_url
     assert urlsplit_calls == [_REPOSITORY_URL]
