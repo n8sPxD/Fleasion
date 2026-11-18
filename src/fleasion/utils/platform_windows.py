@@ -79,7 +79,7 @@ def _windows_oem_encoding() -> str:
         code_page = int(windll.kernel32.GetOEMCP())
         if code_page > 0:
             return f'cp{code_page}'
-    except (AttributeError, OSError, TypeError, ValueError):
+    except AttributeError, OSError, TypeError, ValueError:
         pass
     return locale.getpreferredencoding(False) or 'utf-8'
 
@@ -113,12 +113,10 @@ def run_gdk_debugger_command_line(arguments: list[str] | None = None) -> int:
     args = list(arguments if arguments is not None else sys.argv[1:])
     try:
         thread_id_index = next(
-            index
-            for index, value in enumerate(args)
-            if value.casefold() in {'-tid', '--tid'}
+            index for index, value in enumerate(args) if value.casefold() in {'-tid', '--tid'}
         )
         thread_id = int(args[thread_id_index + 1])
-    except (StopIteration, IndexError, TypeError, ValueError):
+    except StopIteration, IndexError, TypeError, ValueError:
         return 2
     if thread_id <= 0:
         return 2
@@ -208,7 +206,11 @@ def _release_com_instance(interface: ctypes.c_void_p | None) -> None:
 
 def _package_environment_block(environment: dict[str, str]) -> ctypes.Array:
     """Build the double-NUL-terminated UTF-16 block required by PZZWSTR."""
-    entries = [f'{key}={value}' for key, value in sorted(environment.items()) if '\x00' not in key and '\x00' not in value]
+    entries = [
+        f'{key}={value}'
+        for key, value in sorted(environment.items())
+        if '\x00' not in key and '\x00' not in value
+    ]
     return ctypes.create_unicode_buffer('\x00'.join(entries) + '\x00')
 
 
@@ -265,6 +267,27 @@ def _find_pid(exe_name: str) -> Optional[int]:
     """Return the PID of the first process matching exe_name (case-insensitive)."""
     pids = _find_pids(exe_name)
     return pids[0] if pids else None
+
+
+def _parent_pid_of_process(pid: int) -> Optional[int]:
+    """Read the creator PID from Windows's native process snapshot."""
+    kernel32 = ctypes.windll.kernel32
+    snapshot = kernel32.CreateToolhelp32Snapshot(_TH32CS_SNAPPROCESS, 0)
+    if snapshot == _INVALID_HANDLE_VALUE:
+        return None
+    try:
+        entry = _PROCESSENTRY32()
+        entry.dwSize = ctypes.sizeof(_PROCESSENTRY32)
+        if kernel32.Process32First(snapshot, ctypes.byref(entry)):
+            while True:
+                if int(entry.th32ProcessID) == pid:
+                    parent_pid = int(entry.th32ParentProcessID)
+                    return parent_pid if parent_pid > 0 else None
+                if not kernel32.Process32Next(snapshot, ctypes.byref(entry)):
+                    break
+    finally:
+        kernel32.CloseHandle(snapshot)
+    return None
 
 
 def _find_pids(exe_name: str) -> list[int]:
@@ -385,7 +408,7 @@ def _query_process_command_line(pid: int) -> str:
         if not command_line.Buffer or command_line.Length == 0:
             return ''
         return ctypes.string_at(command_line.Buffer, command_line.Length).decode('utf-16-le')
-    except (AttributeError, OSError, TypeError, UnicodeError, ValueError):
+    except AttributeError, OSError, TypeError, UnicodeError, ValueError:
         return ''
     finally:
         k32.CloseHandle(handle)
@@ -614,9 +637,8 @@ def is_roblox_gdk_exe_path(exe_path: Path | str | None) -> bool:
     if not exe_path:
         return False
     normalized = str(exe_path).replace('/', '\\').casefold()
-    return (
-        ('\\windowsapps\\' in normalized and 'robloxgdk' in normalized)
-        or normalized.endswith('\\xboxgames\\roblox\\content\\robloxplayerbeta.exe')
+    return ('\\windowsapps\\' in normalized and 'robloxgdk' in normalized) or normalized.endswith(
+        '\\xboxgames\\roblox\\content\\robloxplayerbeta.exe'
     )
 
 
@@ -642,11 +664,13 @@ def _get_roblox_gdk_package_identity(exe_path: Path) -> tuple[str, str] | None:
                 continue
             candidate = application.attrib.get('Id')
             executable = application.attrib.get('Executable', '')
-            if candidate and (candidate == 'Game' or executable.casefold() == 'gamelaunchhelper.exe'):
+            if candidate and (
+                candidate == 'Game' or executable.casefold() == 'gamelaunchhelper.exe'
+            ):
                 application_id = candidate
                 break
         return package_full_name, f'{package_name}_{publisher_id}!{application_id}'
-    except (ET.ParseError, OSError, UnicodeError, ValueError):
+    except ET.ParseError, OSError, UnicodeError, ValueError:
         return None
 
 
@@ -664,7 +688,7 @@ def _find_installed_roblox_gdk_package_identity(
                 'Bypass',
                 '-Command',
                 "(Get-AppxPackage -Name 'ROBLOXCorporation.RobloxGDK' | "
-                "Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty InstallLocation)",
+                'Sort-Object Version -Descending | Select-Object -First 1 -ExpandProperty InstallLocation)',
             ],
             capture_output=True,
             text=True,
@@ -1027,7 +1051,7 @@ def _activate_roblox_gdk_with_proxy_env(
             for process in query_processes():
                 try:
                     candidate_pid = int(process.get('ProcessId') or 0)
-                except (TypeError, ValueError):
+                except TypeError, ValueError:
                     continue
                 candidate_path = Path(str(process.get('ExecutablePath') or ''))
                 if (
@@ -1113,7 +1137,7 @@ def _extract_roblox_deeplink(command_line: str, marker: str = 'roblox-player:') 
 def _process_info_pid(process) -> int:
     try:
         return int(process.get('ProcessId') or 0)
-    except (AttributeError, TypeError, ValueError):
+    except AttributeError, TypeError, ValueError:
         return 0
 
 
@@ -1198,10 +1222,7 @@ def _relaunch_roblox_exe_with_proxy_env(
 
         if is_roblox_gdk_exe_path(exe_path):
             if not force:
-                if (
-                    is_roblox_gdk_env_proxy_armed()
-                    or is_gdk_env_proxy_activation_in_progress()
-                ):
+                if is_roblox_gdk_env_proxy_armed() or is_gdk_env_proxy_activation_in_progress():
                     _env_proxy_owned_process = (pid, str(exe_path))
                     _env_proxy_relaunches[relaunch_key] = time.monotonic()
                     log_buffer.log(
@@ -1247,6 +1268,14 @@ def _relaunch_roblox_exe_with_proxy_env(
             f'Relaunching {label} through Fleasion env proxy ({launch_kind}): {exe_path}',
         )
         if cancel_event is not None and cancel_event.is_set():
+            return False
+
+        if not _close_env_proxy_launcher_watchdog(pid, cancel_event=cancel_event):
+            log_buffer.log(
+                'Launcher',
+                f'{label} Env Proxy relaunch left Player PID {pid} untouched because '
+                'its launcher watcher could not be stopped',
+            )
             return False
 
         if not _force_close_process_immediately(
@@ -1352,6 +1381,37 @@ def _relaunch_roblox_exe_with_proxy_env(
 
     log_buffer.log('Launcher', f'{label} Env Proxy relaunch skipped: no {label} executable found')
     return False
+
+
+def _close_env_proxy_launcher_watchdog(
+    player_pid: int,
+    *,
+    cancel_event: Optional[threading.Event] = None,
+) -> bool:
+    """Stop launchers that replace a killed Player without Fleasion's environment."""
+    parent_pid = _parent_pid_of_process(player_pid)
+    if parent_pid is None:
+        return True
+
+    parent_exe = _query_exe_path(parent_pid)
+    if parent_exe is None:
+        return True
+    parent_name = parent_exe.name.casefold()
+    if parent_name not in {'froststrap.exe', 'bloxstrap.exe'}:
+        return True
+
+    log_buffer.log(
+        'Launcher',
+        f'{parent_exe.name} watcher PID {parent_pid} owns Player PID {player_pid}; '
+        'stopping it before Env Proxy relaunch',
+    )
+    return _force_close_process_immediately(
+        parent_pid,
+        parent_name,
+        label=parent_exe.name,
+        timeout=4.0,
+        cancel_event=cancel_event,
+    )
 
 
 def relaunch_roblox_with_proxy_env(
@@ -1472,8 +1532,7 @@ def terminate_roblox() -> bool:
     if remaining_pids:
         log_buffer.log(
             'Launcher',
-            f'Cache termination left Roblox running: '
-            f'{_describe_pids(remaining_pids)}',
+            f'Cache termination left Roblox running: {_describe_pids(remaining_pids)}',
         )
         return False
     return True
@@ -1693,16 +1752,16 @@ def _summarize_cache_messages(messages: list[str]) -> list[str]:
             if len(labels) == 1:
                 summary.append(message)
             else:
-                summary.append(f"Roblox cache storage deleted successfully ({', '.join(labels)})")
+                summary.append(f'Roblox cache storage deleted successfully ({", ".join(labels)})')
             continue
 
         if message == 'Storage database (GDK) not found':
             missing_gdk_storage = [message]
             index += 1
-            while (
-                index < len(messages)
-                and messages[index] in {'Storage database (GDK) not found', 'Storage folder (GDK) not found'}
-            ):
+            while index < len(messages) and messages[index] in {
+                'Storage database (GDK) not found',
+                'Storage folder (GDK) not found',
+            }:
                 missing_gdk_storage.append(messages[index])
                 index += 1
             if len(missing_gdk_storage) == 1:
@@ -2270,14 +2329,49 @@ def _launch_with_shell_token(target_str: str, prefer_direct_roblox_uri: bool = F
         _close_handle(shell_process)
 
 
-def _wait_for_roblox_process_start(timeout: float = 6.0) -> bool:
-    """Wait briefly for RobloxPlayerBeta.exe to appear after a launch request."""
-    deadline = time.time() + timeout
-    while time.time() < deadline:
-        if is_roblox_running():
+def _launch_roblox_uri_as_standard_user(target_str: str) -> bool:
+    """Dispatch once to the registered launcher, falling back only on errors."""
+    if _is_process_elevated():
+        if _launch_with_shell_token(target_str, prefer_direct_roblox_uri=False):
+            log_buffer.log(
+                'Launcher',
+                'Roblox protocol dispatched via desktop shell token; '
+                'Player startup is owned by the registered launcher',
+            )
             return True
-        time.sleep(0.2)
-    return is_roblox_running()
+
+        log_buffer.log(
+            'Launcher',
+            'Roblox protocol dispatch failed; falling back to direct executable launch',
+        )
+        if _launch_with_shell_token(target_str, prefer_direct_roblox_uri=True):
+            log_buffer.log('Launcher', 'Direct Roblox executable dispatched via shell token')
+            return True
+        log_buffer.log('Launcher', 'Direct executable fallback via shell token failed')
+        return False
+
+    try:
+        os.startfile(target_str)
+    except OSError as exc:
+        log_buffer.log('Launcher', f'Protocol launch via os.startfile failed: {exc}')
+    else:
+        log_buffer.log(
+            'Launcher',
+            'Roblox protocol dispatched via os.startfile; '
+            'Player startup is owned by the registered launcher',
+        )
+        return True
+
+    log_buffer.log(
+        'Launcher',
+        'Roblox protocol dispatch failed; falling back to direct executable launch',
+    )
+    if _launch_roblox_uri_direct(target_str):
+        log_buffer.log('Launcher', 'Direct Roblox executable dispatched')
+        return True
+
+    log_buffer.log('Launcher', 'Direct executable fallback failed')
+    return False
 
 
 def launch_as_standard_user(target: str | Path) -> bool:
@@ -2297,59 +2391,8 @@ def launch_as_standard_user(target: str | Path) -> bool:
     else:
         log_buffer.log('Launcher', f'Launch request (path): {target_str}')
 
-    was_running_before = is_roblox_running() if is_roblox_uri else False
-
-    def _roblox_launch_confirmed(launch_started: bool, method: str) -> bool:
-        if not launch_started:
-            return False
-        if was_running_before:
-            log_buffer.log('Launcher', f'{method} dispatched while Roblox was already running')
-            return True
-        if _wait_for_roblox_process_start():
-            log_buffer.log('Launcher', f'{method} confirmed Roblox process start')
-            return True
-        log_buffer.log('Launcher', f'{method} did not start Roblox process within timeout')
-        return False
-
     if is_roblox_uri:
-        # Protocol first, raw executable fallback only if protocol launch does not start Roblox.
-        if _is_process_elevated():
-            protocol_started = _launch_with_shell_token(target_str, prefer_direct_roblox_uri=False)
-            if _roblox_launch_confirmed(protocol_started, 'Protocol launch (shell token)'):
-                return True
-
-            log_buffer.log(
-                'Launcher',
-                'Protocol launch failed to start Roblox; falling back to direct executable launch',
-            )
-            direct_started = _launch_with_shell_token(target_str, prefer_direct_roblox_uri=True)
-            if _roblox_launch_confirmed(direct_started, 'Direct executable launch (shell token)'):
-                return True
-
-            log_buffer.log('Launcher', 'Direct executable fallback via shell token failed')
-            return False
-
-        try:
-            os.startfile(target_str)
-            protocol_started = True
-            log_buffer.log('Launcher', 'Protocol launch dispatched via os.startfile')
-        except OSError as exc:
-            protocol_started = False
-            log_buffer.log('Launcher', f'Protocol launch via os.startfile failed: {exc}')
-
-        if _roblox_launch_confirmed(protocol_started, 'Protocol launch (os.startfile)'):
-            return True
-
-        log_buffer.log(
-            'Launcher',
-            'Protocol launch failed to start Roblox; falling back to direct executable launch',
-        )
-        direct_started = _launch_roblox_uri_direct(target_str)
-        if _roblox_launch_confirmed(direct_started, 'Direct executable launch'):
-            return True
-
-        log_buffer.log('Launcher', 'Direct executable fallback failed')
-        return False
+        return _launch_roblox_uri_as_standard_user(target_str)
 
     # os.startfile inherits the current process token. If Fleasion is elevated,
     # using it here would reintroduce the exact admin-inheritance bug.
