@@ -2,6 +2,12 @@ name: Build Draft Release
 
 on:
   workflow_dispatch:
+    inputs:
+      windows_only:
+        description: Build only the Windows package
+        required: false
+        default: false
+        type: boolean
 
 permissions:
   contents: write
@@ -10,6 +16,8 @@ jobs:
   build-packages:
     name: Build packages
     uses: ./.github/workflows/build.yml
+    with:
+      windows_only: ${{ inputs.windows_only }}
 
   draft-release:
     name: Create draft release

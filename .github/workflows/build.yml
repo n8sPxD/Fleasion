@@ -2,6 +2,12 @@ name: Build PyInstaller Packages
 
 on:
   workflow_call:
+    inputs:
+      windows_only:
+        description: Build only the Windows package.
+        required: false
+        default: false
+        type: boolean
     outputs:
       app_version:
         description: Application version from pyproject.toml.
@@ -60,6 +66,7 @@ jobs:
   build:
     name: Build ${{ matrix.name }}
     needs: prepare
+    if: inputs.windows_only != true || matrix.name == 'Windows'
     runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
