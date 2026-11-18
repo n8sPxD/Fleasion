@@ -41,6 +41,18 @@ if TYPE_CHECKING:
     from .addons.texture_stripper import TextureStripper
 
 from .roblox_metadata import strip_roblox_metadata
+from .asset_batch import (
+    decode_v3_request,
+    decode_v3_response,
+    encode_v3_request,
+    encode_v3_response,
+)
+from .addons.texture_stripper import is_synthetic_cdn_request
+from .asset_delivery import direct_asset_id, is_asset_batch_path, is_direct_asset_path
+from .h2_transport import H2FeatureBridge
+from .splice import SpliceConnection, read_client_hello
+from .splice_keys import KeyProvider
+from .tls_records import read_record
 from .upstream import (
     AutoConnector,
     BaseUpstreamConnector,
@@ -50,6 +62,7 @@ from .upstream import (
     Socks5Connector,
     Socks5ProxyConfig,
     UnavailableConnector,
+    _blocking_http_connect_socket,
     UpstreamConnectResult,
     UpstreamEndpoint,
     UpstreamMode,
@@ -1078,6 +1091,8 @@ def _make_local_response(status_code: int = 204, body: bytes = b'') -> bytes:
         400: 'Bad Request',
         403: 'Forbidden',
         404: 'Not Found',
+        405: 'Method Not Allowed',
+        410: 'Gone',
         500: 'Internal Server Error',
     }
     reason = reason_map.get(status_code, 'OK')
@@ -1231,6 +1246,7 @@ class FleasionProxy:
         intercept_all_hosts: bool = False,
         intercept_excluded_hosts: Optional[Iterable[str]] = None,
         auto_replace_rules: Optional[Iterable[dict]] = None,
+        tls_splice: bool = False,
     ) -> None:
         self.texture_stripper = texture_stripper
         self.cache_scraper = cache_scraper
@@ -1250,6 +1266,10 @@ class FleasionProxy:
         self._fallback_diagnostics_seen: set[tuple[str, str]] = set()
         self._client_settings_dictionary_cache: Dict[str, bytes] = {}
         self._wire_preserving_passthrough = bool(wire_preserving_passthrough)
+        self._tls_splice = bool(tls_splice)
+        self._splice_keys = KeyProvider() if self._tls_splice else None
+        self._splice_tasks: set[asyncio.Task[object]] = set()
+        self._splice_decrypted_hosts: set[str] = set()
         self._explicit_proxy = bool(explicit_proxy)
         self._intercept_hosts: frozenset = (
             frozenset(intercept_hosts) if intercept_hosts is not None else INTERCEPT_HOSTS
@@ -1275,6 +1295,7 @@ class FleasionProxy:
         self._pending: Dict[Tuple[int, str], PendingIntercept] = {}
         self._last_gamejoin_time: float = 0.0
         self._last_asset_traffic_time: float = 0.0
+        self._batch_routes_event = asyncio.Event()
         self._asset_diag_generation: int = 0
         self._on_upstream_connect_failure = on_upstream_connect_failure
         self._upstream_connect_failure_notified = False
@@ -1440,7 +1461,7 @@ class FleasionProxy:
             self._handle_client,
             host='127.0.0.1',
             port=self.port,
-            ssl=None if self._explicit_proxy else self._server_ssl_ctx,
+            ssl=None if self._explicit_proxy or self._tls_splice else self._server_ssl_ctx,
             backlog=256,
             reuse_address=True,
         )
@@ -1449,7 +1470,11 @@ class FleasionProxy:
         self.port = int(self._server.sockets[0].getsockname()[1])
         self._servers = [self._server]
         self._listening_loopbacks = {'127.0.0.1'}
-        mode = 'HTTP CONNECT' if self._explicit_proxy else 'TLS'
+        mode = (
+            'HTTP CONNECT'
+            if self._explicit_proxy
+            else ('TLS splice' if self._tls_splice else 'TLS')
+        )
         logger.info('Fleasion proxy listening on 127.0.0.1:%d (%s)', self.port, mode)
 
         try:
@@ -1457,7 +1482,7 @@ class FleasionProxy:
                 self._handle_client,
                 host='::1',
                 port=self.port,
-                ssl=None if self._explicit_proxy else self._server_ssl_ctx,
+                ssl=None if self._explicit_proxy or self._tls_splice else self._server_ssl_ctx,
                 backlog=256,
                 reuse_address=True,
             )
@@ -1763,6 +1788,13 @@ class FleasionProxy:
             pending.action = 'drop'
             pending.event.set()
 
+        if self._splice_keys is not None:
+            self._splice_keys.clear()
+        splice_tasks = list(self._splice_tasks)
+        for task in splice_tasks:
+            task.cancel()
+        await asyncio.gather(*splice_tasks, return_exceptions=True)
+
         servers = list(self._servers)
         if self._server is not None and self._server not in servers:
             servers.append(self._server)
@@ -2032,6 +2064,21 @@ class FleasionProxy:
     async def _handle_client(
         self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
     ) -> None:
+        if self._tls_splice:
+            task = asyncio.current_task()
+            if task is not None:
+                self._splice_tasks.add(task)
+            try:
+                if self._explicit_proxy:
+                    await self._handle_explicit_proxy_client(reader, writer)
+                else:
+                    await self._handle_direct_splice(reader, writer)
+            finally:
+                writer.close()
+                if task is not None:
+                    self._splice_tasks.discard(task)
+            return
+
         if self._explicit_proxy:
             await self._handle_explicit_proxy_client(reader, writer)
             return
@@ -2118,6 +2165,10 @@ class FleasionProxy:
             )
             return
 
+        if self._tls_splice:
+            await self._serve_splice(reader, writer, host, port, explicit=True)
+            return
+
         writer.write(b'HTTP/1.1 200 Connection Established\r\nProxy-Agent: Fleasion\r\n\r\n')
         await writer.drain()
 
@@ -2158,6 +2209,187 @@ class FleasionProxy:
             except Exception:
                 pass
 
+    def mark_splice_decrypted(self, host: str) -> bool:
+        """Record the first live traffic decrypted for a host."""
+        if host in self._splice_decrypted_hosts:
+            return False
+        self._splice_decrypted_hosts.add(host)
+        return True
+
+    async def _serve_splice(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        host: str,
+        port: int,
+        *,
+        explicit: bool,
+        client_records: Sequence[bytes] = (),
+    ) -> None:
+        del port
+        from ..utils import log_buffer
+
+        keys = self._splice_keys
+        if keys is None:
+            raise ValueError('Splice key provider is unavailable')
+        result = await self._connector.connect(host, self._endpoints_for_host(host), None, 10.0)
+        if result.reader is None or result.writer is None:
+            if explicit:
+                writer.write(b'HTTP/1.1 502 Bad Gateway\r\nConnection: close\r\n\r\n')
+                await writer.drain()
+            writer.close()
+            self._notify_upstream_connect_failure_once(host, result.error or 'TCP tunnel failed')
+            return
+        if explicit:
+            writer.write(b'HTTP/1.1 200 Connection Established\r\nProxy-Agent: Fleasion\r\n\r\n')
+            await writer.drain()
+            try:
+                first_record = await asyncio.wait_for(read_record(reader), timeout=10.0)
+            except asyncio.IncompleteReadError, ConnectionResetError, TimeoutError:
+                result.writer.close()
+                writer.close()
+                return
+            except (OSError, ValueError) as exc:
+                log_buffer.log(
+                    'Proxy',
+                    f'Invalid TLS record after CONNECT for {host}: {type(exc).__name__}: {exc}',
+                )
+                result.writer.close()
+                writer.close()
+                return
+            if first_record[0] != 22:
+                log_buffer.log('Proxy', f'Expected TLS ClientHello after CONNECT for {host}')
+                result.writer.close()
+                writer.close()
+                return
+            client_records = (*client_records, first_record)
+
+        connection = SpliceConnection(
+            reader,
+            writer,
+            result.reader,
+            result.writer,
+            keys=keys,
+            client_records=client_records,
+        )
+        try:
+            await connection.run(self, host)
+            if connection.transparent_passthrough:
+                log_buffer.log(
+                    'TLS',
+                    f'TLS connection for {host} used transparent passthrough '
+                    f'({connection.passthrough_reason})',
+                )
+        except (OSError, ValueError, TimeoutError) as exc:
+            log_buffer.log(
+                'Proxy',
+                f'TLS splice failed for {host}: {type(exc).__name__}: {exc}; '
+                f'{connection.diagnostic_state()}',
+            )
+        finally:
+            result.writer.close()
+            writer.close()
+
+    async def _handle_direct_splice(
+        self, reader: asyncio.StreamReader, writer: asyncio.StreamWriter
+    ) -> None:
+        from ..utils import log_buffer
+
+        try:
+            host, records = await asyncio.wait_for(read_client_hello(reader), timeout=15.0)
+            if host not in self._intercept_hosts:
+                writer.close()
+                return
+            await self._serve_splice(
+                reader, writer, host, 443, explicit=False, client_records=records
+            )
+        except asyncio.IncompleteReadError, TimeoutError:
+            writer.close()
+        except (OSError, ValueError) as exc:
+            log_buffer.log('Proxy', f'Direct TLS splice failed: {exc}')
+            writer.close()
+
+    async def serve_spliced_session(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        host: str,
+        upstream: UpstreamConnectResult,
+    ) -> None:
+        """Run HTTP feature processing over an authenticated TLS splice."""
+        first = await asyncio.wait_for(_read_headers_raw(reader), timeout=15.0)
+        if first is None:
+            return
+        if first.first_line == b'PRI * HTTP/2.0':
+            from ..utils import log_buffer
+
+            if self.mark_splice_decrypted(f'h2:{host}'):
+                log_buffer.log(
+                    'TLS',
+                    f'Live TLS splice selected HTTP/2 application transport for {host}',
+                )
+            await self.serve_decrypted_h2_session(
+                reader,
+                writer,
+                host,
+                upstream,
+                initial_client_data=first.raw_header_block,
+            )
+            return
+        if b' HTTP/1.' not in first.first_line:
+            raise ValueError('The negotiated splice application protocol is not HTTP/1.1')
+        await self._http_session(first, reader, writer, host, upstream=upstream)
+
+    async def serve_decrypted_http_session(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        host: str,
+        upstream: UpstreamConnectResult,
+    ) -> None:
+        """Run the HTTP/1 feature engine on an authenticated plaintext stream."""
+        first = await asyncio.wait_for(_read_headers_raw(reader), timeout=15.0)
+        if first is None:
+            return
+        await self._http_session(first, reader, writer, host, upstream=upstream)
+
+    async def serve_decrypted_h2_session(
+        self,
+        reader: asyncio.StreamReader,
+        writer: asyncio.StreamWriter,
+        host: str,
+        upstream: UpstreamConnectResult,
+        *,
+        initial_client_data: bytes = b'',
+    ) -> None:
+        """Run multiplexed HTTP/2 features on authenticated plaintext streams."""
+        normalized_host = host.strip().lower().rstrip('.')
+        if not self._should_intercept_explicit_host(normalized_host, 443):
+            raise ValueError('Host is not enabled for HTTP interception')
+        await H2FeatureBridge(self, normalized_host, reader, writer, upstream).run(
+            initial_client_data=initial_client_data
+        )
+
+    def may_stream_untouched_cdn(self) -> bool:
+        """Whether CDN responses can bypass HTTP/1 feature conversion."""
+        return (
+            not self.cache_scraper.enabled
+            and not self._auto_replace_rules
+            and not self._intercept_all_hosts
+        )
+
+    def batch_route_change_event(self) -> asyncio.Event:
+        """Return the current event for pending asset-batch completion."""
+        event = self._batch_routes_event
+        self._batch_routes_event = asyncio.Event()
+        return event
+
+    def _signal_batch_route_change(self) -> None:
+        """Wake CDN requests waiting for a completed asset-delivery batch."""
+        event = self._batch_routes_event
+        self._batch_routes_event = asyncio.Event()
+        event.set()
+
     async def _tunnel_explicit_proxy_connection(
         self,
         client_reader: asyncio.StreamReader,
@@ -2170,7 +2402,7 @@ class FleasionProxy:
 
         start = time.time()
 
-        result = await _open_explicit_proxy_tunnel(host, port)
+        result = await self._open_routed_explicit_proxy_tunnel(host, port)
         if result.writer is None or result.reader is None:
             log_buffer.log(
                 'Proxy',
@@ -2234,12 +2466,56 @@ class FleasionProxy:
                 except Exception:
                     pass
 
+    async def _open_routed_explicit_proxy_tunnel(
+        self, host: str, port: int
+    ) -> _ExplicitTunnelConnectResult:
+        connector = self._system_http_connector
+        proxy = getattr(connector, 'proxy', None) if connector is not None else None
+        if proxy is None:
+            return await _open_explicit_proxy_tunnel(host, port)
+
+        loop = asyncio.get_running_loop()
+        endpoint = f'{proxy.host}:{proxy.port}->{host}:{port}'
+        raw_socket: Optional[socket.socket] = None
+        try:
+            raw_socket = await loop.run_in_executor(
+                None,
+                _blocking_http_connect_socket,
+                proxy.host,
+                proxy.port,
+                host,
+                port,
+                _EXPLICIT_TUNNEL_CONNECT_TIMEOUT,
+                proxy.username,
+                proxy.password,
+            )
+            reader, writer = await asyncio.open_connection(sock=raw_socket)
+            raw_socket = None
+            return _ExplicitTunnelConnectResult(
+                reader=reader,
+                writer=writer,
+                endpoint=f'system_http_connect {endpoint}',
+            )
+        except Exception as exc:
+            if raw_socket is not None:
+                raw_socket.close()
+            direct = await _open_explicit_proxy_tunnel(host, port)
+            if direct.writer is not None:
+                return direct
+            proxy_error = _format_exc(exc)
+            direct_error = direct.error or 'direct tunnel failed'
+            direct.error = (
+                f'system_http_connect {endpoint}: {proxy_error}; direct_ip: {direct_error}'
+            )
+            return direct
+
     async def _http_session(
         self,
         first_req: RawHeaders,
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
         host: str,
+        upstream: Optional[UpstreamConnectResult] = None,
     ) -> None:
         from ..utils import log_buffer
 
@@ -2250,14 +2526,22 @@ class FleasionProxy:
         up_reader: Optional[asyncio.StreamReader] = None
         up_writer: Optional[asyncio.StreamWriter] = None
         upstream_failure_hint_logged = False
+        supplied_upstream_used = False
 
         async def ensure_upstream(path_for_log: str) -> bool:
             nonlocal up_reader, up_writer, upstream_failure_hint_logged
+            nonlocal supplied_upstream_used
 
             if up_reader is not None and up_writer is not None and not up_writer.is_closing():
                 return True
 
-            connect_result = await self._connect_upstream(host)
+            if upstream is not None:
+                if supplied_upstream_used:
+                    return False
+                connect_result = upstream
+                supplied_upstream_used = True
+            else:
+                connect_result = await self._connect_upstream(host)
             up_reader = connect_result.reader
             up_writer = connect_result.writer
 
@@ -2508,7 +2792,13 @@ class FleasionProxy:
                     _log_entry,
                     hold=self._intercept_all_hosts and self._intercept_matches(host, path),
                 )
-                is_batch = host == ASSET_DELIVERY_HOST and b'/v1/assets/batch' in req_first
+                is_batch = (
+                    host == ASSET_DELIVERY_HOST
+                    and method.upper() == 'POST'
+                    and is_asset_batch_path(path)
+                )
+                is_v3_batch = path.split('?', 1)[0].rstrip('/') == '/v3/assets/batch'
+                v3_request_context = None
                 bypass_custom_fflags = (
                     req_headers.get(_BROWSER_BYPASS_CUSTOM_FFLAGS_HEADER, b'').strip() == b'1'
                 )
@@ -2541,6 +2831,27 @@ class FleasionProxy:
                 ):
                     upstream_req_headers = _without_conditional_client_settings_headers(req_headers)
 
+                if (
+                    host == ASSET_DELIVERY_HOST
+                    and not is_batch
+                    and method.upper() in ('GET', 'HEAD')
+                    and is_direct_asset_path(path)
+                ):
+                    updated_path = self.texture_stripper.rewrite_direct_asset_id(
+                        path, replacements_tuple
+                    )
+                    if updated_path != path:
+                        parts = req_first.split(b' ', 2)
+                        if len(parts) == 3:
+                            upstream_req_first = (
+                                parts[0] + b' ' + updated_path.encode('ascii') + b' ' + parts[2]
+                            )
+                            log_buffer.log(
+                                'Replacer',
+                                f'Replaced {direct_asset_id(path) or ""} -> '
+                                f'{direct_asset_id(updated_path) or ""} (unbatched)',
+                            )
+
                 if host == ASSET_DELIVERY_HOST or host in CDN_HOSTS:
                     self._note_asset_traffic()
 
@@ -2555,6 +2866,15 @@ class FleasionProxy:
                 # requiring multiple rejoins to achieve full replacement coverage.
                 short_circuit = None
                 if host in CDN_HOSTS:
+                    managed = is_synthetic_cdn_request(host, path)
+                    is_head = req_first.startswith(b'HEAD ')
+                    if not req_first.startswith(b'GET ') and not (managed and is_head):
+                        if managed:
+                            writer.write(_make_local_response(405))
+                            await writer.drain()
+                            if not _keep_alive(req_first, req_headers):
+                                break
+                            continue
                     short_circuit = self.texture_stripper.check_cdn_request(host, path)
                     if short_circuit is None and self.texture_stripper.has_pending():
                         # Yield to event loop in short increments, retrying up to ~600ms.
@@ -2566,6 +2886,12 @@ class FleasionProxy:
                                 break
                             if not self.texture_stripper.has_pending():
                                 break  # all pending resolved, this URL just isn't ours
+                    if short_circuit is None and managed:
+                        writer.write(_make_local_response(410))
+                        await writer.drain()
+                        if not _keep_alive(req_first, req_headers):
+                            break
+                        continue
 
                     if short_circuit is not None:
                         action, value = short_circuit
@@ -2586,6 +2912,9 @@ class FleasionProxy:
                             response = await asyncio.get_event_loop().run_in_executor(
                                 self._executor, _serve_local_file, value
                             )
+                            if is_head:
+                                header_block, delimiter, _body = response.partition(b'\r\n\r\n')
+                                response = header_block + delimiter if delimiter else response
                             _status_line = (
                                 response.split(b'\r\n', 1)[0].decode('ascii', errors='replace')
                                 if response
@@ -2599,7 +2928,7 @@ class FleasionProxy:
                             writer.write(response)
                             await writer.drain()
                             # Cache our own served file so it appears in the scraper viewer
-                            if self.cache_scraper.enabled:
+                            if self.cache_scraper.enabled and not managed and not is_head:
                                 try:
                                     _file_bytes = await asyncio.get_event_loop().run_in_executor(
                                         self._executor, _read_local_bytes, value
@@ -2630,6 +2959,14 @@ class FleasionProxy:
                 if is_batch:
                     # Decompress for reading/modifying, send uncompressed to upstream
                     req_body_plain = _decompress_body(req_body_raw, req_headers)
+                    addon_request = req_body_plain
+                    decoded_batch = True
+                    if is_v3_batch:
+                        normalized = decode_v3_request(req_body_plain)
+                        if normalized is None:
+                            decoded_batch = False
+                        else:
+                            addon_request, v3_request_context = normalized
                     # Unique ID for this specific batch request/response pair.
                     # Keyed into _pending as f'{batch_id}_{req_id}' so parallel
                     # connections using the same req_id integers don't collide —
@@ -2643,25 +2980,43 @@ class FleasionProxy:
                     # _pending, skipped the wait, and forwarded unreplaced assets. Running
                     # synchronously ensures _pending is populated before any CDN coroutine
                     # can check has_pending().
-                    req_body_modified, scraper_body = self.texture_stripper.process_batch_request(
-                        req_body_plain,
-                        req_headers,
-                        replacements_tuple,
-                        batch_id,
-                    )
+                    if decoded_batch:
+                        req_body_modified, scraper_body = (
+                            self.texture_stripper.process_batch_request(
+                                addon_request,
+                                req_headers,
+                                replacements_tuple,
+                                batch_id,
+                            )
+                        )
+                    else:
+                        req_body_modified = req_body_raw
+                        scraper_body = req_body_raw
                     if _is_empty_json_array(req_body_modified) and not _is_empty_json_array(
-                        req_body_plain
+                        addon_request
                     ):
-                        writer.write(_make_local_response(200, b'[]'))
+                        writer.write(
+                            _make_local_response(200, b'{"assets":[]}' if is_v3_batch else b'[]')
+                        )
                         await writer.drain()
                         if not _keep_alive(req_first, req_headers):
                             break
                         continue
                     if not await ensure_upstream(path):
                         break
-                    up_writer.write(
-                        _build_modified_request(req_first, req_headers, req_body_modified)
-                    )
+                    if not decoded_batch or req_body_modified == addon_request:
+                        up_writer.write(req_raw.raw_header_block + req_body.wire)
+                    else:
+                        outgoing_body = (
+                            encode_v3_request(req_body_modified, v3_request_context)
+                            if v3_request_context is not None
+                            else req_body_modified
+                        )
+                        if outgoing_body is None:
+                            raise ValueError('Asset batch request could not be rebuilt as V3')
+                        up_writer.write(
+                            _build_modified_request(req_first, req_headers, outgoing_body)
+                        )
                 elif host == GAMEJOIN_HOST:
                     # Module interceptors: allow request body/URL modification for gamejoin traffic
                     _req_body_plain = _decompress_body(req_body_raw, req_headers)
@@ -2767,9 +3122,7 @@ class FleasionProxy:
                         f'ClientSettings upstream returned HTTP {status_code}; response left unchanged',
                     )
                 elif (
-                    custom_fflag_response_enabled
-                    and 200 <= status_code < 300
-                    and not resp_body_raw
+                    custom_fflag_response_enabled and 200 <= status_code < 300 and not resp_body_raw
                 ):
                     self.custom_fflag_modifier.log_response_failure(
                         'empty-success',
@@ -2818,23 +3171,42 @@ class FleasionProxy:
                 if is_batch:
                     # Batch response: forward raw to Roblox, decompress only for addon hooks
                     resp_body_plain = _decompress_body(resp_body_raw, resp_headers)
+                    response_context = None
+                    if is_v3_batch and v3_request_context is not None:
+                        normalized_response = decode_v3_response(resp_body_plain)
+                        if normalized_response is not None:
+                            resp_body_plain, response_context = normalized_response
+                    can_process_batch = not is_v3_batch or (
+                        v3_request_context is not None and response_context is not None
+                    )
                     # Addon hooks must use req_body_modified (what we actually sent to
                     # upstream), NOT req_body_raw. The upstream response is index-aligned
                     # with the modified request. If assets were removed by process_batch_request
                     # (strip_textures, removal rules), using req_body_raw causes every index
                     # after a removed item to map to the wrong response item, producing wrong
                     # assetTypeId values (the root cause of SolidModel/Mesh being typed as Image).
-                    self.texture_stripper.process_batch_response(
-                        req_body_modified,
-                        resp_body_plain,
-                        req_headers,
-                        batch_id,
-                    )
-                    if self.cache_scraper.enabled:
-                        self.cache_scraper.process_batch_response(
-                            scraper_body,
+                    if can_process_batch:
+                        rewritten_batch = self.texture_stripper.process_batch_response(
+                            req_body_modified,
                             resp_body_plain,
+                            req_headers,
+                            batch_id,
                         )
+                        if self.cache_scraper.enabled:
+                            self.cache_scraper.process_batch_response(
+                                scraper_body,
+                                resp_body_plain,
+                            )
+                        if rewritten_batch is not None and rewritten_batch != resp_body_plain:
+                            encoded_batch = (
+                                encode_v3_response(rewritten_batch, response_context)
+                                if is_v3_batch and response_context is not None
+                                else rewritten_batch
+                            )
+                            if encoded_batch is not None:
+                                resp_body_raw = encoded_batch
+                                response_modified = True
+                    self._signal_batch_route_change()
 
                 elif host == ASSET_DELIVERY_HOST and not is_batch:
                     # Non-batch assetdelivery response (confirmed rare/non-existent
@@ -2987,11 +3359,7 @@ class FleasionProxy:
                             full_url, path, resp_body_for_cache, ct
                         )
 
-                elif (
-                    custom_fflag_response_enabled
-                    and 200 <= status_code < 300
-                    and resp_body_raw
-                ):
+                elif custom_fflag_response_enabled and 200 <= status_code < 300 and resp_body_raw:
                     content_encoding = resp_headers.get(b'content-encoding', b'').lower()
                     if content_encoding == b'dcz':
                         dictionary_sha256 = _dcz_dictionary_sha256(path)
@@ -3155,10 +3523,7 @@ class FleasionProxy:
                 except ConnectionResetError, BrokenPipeError, OSError:
                     break
 
-                if (
-                    custom_fflag_delivered_signature is not None
-                    and not delivery_ack_deferred
-                ):
+                if custom_fflag_delivered_signature is not None and not delivery_ack_deferred:
                     self.custom_fflag_modifier.note_response_success(
                         custom_fflag_delivered_signature,
                         generation=custom_fflag_request_generation,

@@ -67,7 +67,7 @@ class BaseUpstreamConnector:
         self,
         host: str,
         endpoints: Sequence[UpstreamEndpoint],
-        ssl_ctx: ssl.SSLContext,
+        ssl_ctx: ssl.SSLContext | None,
         timeout: float,
     ) -> UpstreamConnectResult:
         raise NotImplementedError
@@ -109,7 +109,7 @@ class DirectIpConnector(BaseUpstreamConnector):
         self,
         host: str,
         endpoints: Sequence[UpstreamEndpoint],
-        ssl_ctx: ssl.SSLContext,
+        ssl_ctx: ssl.SSLContext | None,
         timeout: float,
     ) -> UpstreamConnectResult:
         failures: list[str] = []
@@ -123,7 +123,7 @@ class DirectIpConnector(BaseUpstreamConnector):
                         target,
                         ep.port,
                         ssl=ssl_ctx,
-                        server_hostname=host,
+                        server_hostname=host if ssl_ctx is not None else None,
                         family=ep.family or 0,
                     ),
                     timeout=timeout,
@@ -202,7 +202,7 @@ class HttpConnectConnector(BaseUpstreamConnector):
         self,
         host: str,
         endpoints: Sequence[UpstreamEndpoint],
-        ssl_ctx: ssl.SSLContext,
+        ssl_ctx: ssl.SSLContext | None,
         timeout: float,
     ) -> UpstreamConnectResult:
         loop = asyncio.get_running_loop()
@@ -226,7 +226,7 @@ class HttpConnectConnector(BaseUpstreamConnector):
                 asyncio.open_connection(
                     sock=raw_sock,
                     ssl=ssl_ctx,
-                    server_hostname=host,
+                    server_hostname=host if ssl_ctx is not None else None,
                 ),
                 timeout=timeout,
             )
@@ -340,7 +340,7 @@ class Socks5Connector(BaseUpstreamConnector):
         self,
         host: str,
         endpoints: Sequence[UpstreamEndpoint],
-        ssl_ctx: ssl.SSLContext,
+        ssl_ctx: ssl.SSLContext | None,
         timeout: float,
     ) -> UpstreamConnectResult:
         loop = asyncio.get_running_loop()
@@ -363,7 +363,7 @@ class Socks5Connector(BaseUpstreamConnector):
                 asyncio.open_connection(
                     sock=raw_sock,
                     ssl=ssl_ctx,
-                    server_hostname=host,
+                    server_hostname=host if ssl_ctx is not None else None,
                 ),
                 timeout=timeout,
             )
@@ -396,7 +396,7 @@ class UnavailableConnector(BaseUpstreamConnector):
         self,
         host: str,
         endpoints: Sequence[UpstreamEndpoint],
-        ssl_ctx: ssl.SSLContext,
+        ssl_ctx: ssl.SSLContext | None,
         timeout: float,
     ) -> UpstreamConnectResult:
         return UpstreamConnectResult(
@@ -477,7 +477,7 @@ class AutoConnector(BaseUpstreamConnector):
         connector: BaseUpstreamConnector,
         host: str,
         endpoints: Sequence[UpstreamEndpoint],
-        ssl_ctx: ssl.SSLContext,
+        ssl_ctx: ssl.SSLContext | None,
         timeout: float,
         failures: list[str],
     ) -> UpstreamConnectResult:
@@ -493,7 +493,7 @@ class AutoConnector(BaseUpstreamConnector):
         self,
         host: str,
         endpoints: Sequence[UpstreamEndpoint],
-        ssl_ctx: ssl.SSLContext,
+        ssl_ctx: ssl.SSLContext | None,
         timeout: float,
     ) -> UpstreamConnectResult:
         now = time.monotonic()

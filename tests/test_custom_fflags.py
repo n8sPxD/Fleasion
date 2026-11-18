@@ -233,8 +233,7 @@ def test_modifier_primes_the_uncompressed_windows_flag_cache(tmp_path):
     )
     cache_path = tmp_path / 'flag_cache.dat'
     cache_path.write_bytes(
-        b'\x00\x00\x00\x00\x00'
-        + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
+        b'\x00\x00\x00\x00\x00' + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
     )
     modifier = CustomFFlagModifier(config, flag_cache_path=cache_path)
 
@@ -256,8 +255,7 @@ def test_modifier_removes_disabled_override_from_windows_flag_cache(tmp_path):
     )
     cache_path = tmp_path / 'flag_cache.dat'
     cache_path.write_bytes(
-        b'\x00\x00\x00\x00\x00'
-        + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
+        b'\x00\x00\x00\x00\x00' + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
     )
     modifier = CustomFFlagModifier(config, flag_cache_path=cache_path)
 
@@ -278,8 +276,7 @@ def test_modifier_removes_all_saved_overrides_when_windows_feature_is_disabled(t
     )
     cache_path = tmp_path / 'flag_cache.dat'
     cache_path.write_bytes(
-        b'\x00\x00\x00\x00\x00'
-        + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
+        b'\x00\x00\x00\x00\x00' + json.dumps({'applicationSettings': {'Existing': 'True'}}).encode()
     )
     modifier = CustomFFlagModifier(config, flag_cache_path=cache_path)
 
@@ -509,9 +506,7 @@ def test_proxy_logs_empty_2xx_client_settings_responses_as_delivery_failures():
 
         _run_client_settings_session(
             modifier,
-            b'HTTP/1.1 '
-            + status_line
-            + b'\r\nContent-Length: 0\r\nConnection: close\r\n\r\n',
+            b'HTTP/1.1 ' + status_line + b'\r\nContent-Length: 0\r\nConnection: close\r\n\r\n',
         )
 
         assert failures == [
@@ -699,7 +694,7 @@ def test_request_started_before_launch_generation_bump_cannot_satisfy_new_player
 def test_fresh_client_settings_request_strips_only_conditional_headers():
     original = {
         b'accept-encoding': b'dcz',
-        b'if-none-match': b'\"old-etag\"',
+        b'if-none-match': b'"old-etag"',
         b'if-modified-since': b'last week',
     }
 
@@ -833,14 +828,17 @@ def test_dcz_round_trip_uses_the_client_dictionary_and_extracts_its_hash():
 
     assert compressed is not None
     assert _decompress_dcz(compressed, dictionary) == plain
-    assert _dcz_dictionary_sha256(
-        '/v2/settings-compressed/application/GoogleAndroidApp/'
-        '69341cc9f35ea6437489227f58455ee226e77c469204ec273eb3e4a05e2f947b.dcz?x=1'
-    ) == '69341cc9f35ea6437489227f58455ee226e77c469204ec273eb3e4a05e2f947b'
+    assert (
+        _dcz_dictionary_sha256(
+            '/v2/settings-compressed/application/GoogleAndroidApp/'
+            '69341cc9f35ea6437489227f58455ee226e77c469204ec273eb3e4a05e2f947b.dcz?x=1'
+        )
+        == '69341cc9f35ea6437489227f58455ee226e77c469204ec273eb3e4a05e2f947b'
+    )
     assert _dcz_dictionary_sha256('/v2/client-version/WindowsPlayer') is None
 
 
-def test_windows_custom_fflags_intercept_clientsettings_before_player_starts(monkeypatch):
+def test_windows_tunnels_clientsettings_to_preserve_signed_responses(monkeypatch):
     monkeypatch.setattr(proxy_master, 'IS_WINDOWS', True)
 
     proxy = proxy_master.ProxyMaster.__new__(proxy_master.ProxyMaster)
@@ -849,9 +847,9 @@ def test_windows_custom_fflags_intercept_clientsettings_before_player_starts(mon
     proxy.custom_fflag_modifier = SimpleNamespace(is_enabled=lambda: True)
     proxy._roblox_player_running = False
 
-    assert proxy._desired_intercept_hosts() == (
-        set(BASE_INTERCEPT_HOSTS) | set(CUSTOM_FFLAGS_INTERCEPT_HOSTS)
-    )
+    hosts = proxy._desired_intercept_hosts()
+    assert hosts == set(BASE_INTERCEPT_HOSTS)
+    assert not hosts & CUSTOM_FFLAGS_INTERCEPT_HOSTS
 
 
 def test_master_primes_custom_flag_cache_only_while_player_is_closed(monkeypatch):

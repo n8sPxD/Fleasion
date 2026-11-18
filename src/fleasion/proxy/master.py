@@ -811,6 +811,42 @@ async def _tls_self_test_result(
     )
 
 
+def _probe_splice_route_sync(host: str, port: int) -> None:
+    """Verify that an explicit splice route can open its upstream transport."""
+    with socket.create_connection(('127.0.0.1', port), timeout=5.0) as connection:
+        connection.settimeout(15.0)
+        connection.sendall(
+            (
+                f'CONNECT {host}:443 HTTP/1.1\r\n'
+                f'Host: {host}:443\r\n'
+                'Proxy-Connection: Keep-Alive\r\n\r\n'
+            ).encode('ascii')
+        )
+        response = bytearray()
+        while b'\r\n\r\n' not in response:
+            chunk = connection.recv(4096)
+            if not chunk:
+                raise OSError('splice probe closed while awaiting CONNECT response')
+            response += chunk
+            if len(response) > 65536:
+                raise OSError('splice probe CONNECT response too large')
+        status_line = response.split(b'\r\n', 1)[0]
+        if b' 200 ' not in status_line and not status_line.startswith(b'HTTP/1.1 200'):
+            raise OSError(f'splice probe CONNECT failed: {status_line!r}')
+
+
+async def _splice_connect_probe_result(hosts: set[str], port: int) -> tuple[bool, list[str]]:
+    """Probe explicit splice routes while allowing each upstream call to finish."""
+    loop = asyncio.get_running_loop()
+    failures: list[str] = []
+    for host in sorted(hosts):
+        try:
+            await loop.run_in_executor(None, _probe_splice_route_sync, host, port)
+        except Exception as exc:
+            failures.append(f'{host}={type(exc).__name__}: {exc}')
+    return not failures, failures
+
+
 def _run_raw_tls_loopback_probe_sync(
     host: str,
     ca_cert_path: Path,
@@ -1972,8 +2008,10 @@ def _spilled_hosts_line_should_remove(line_file, hosts: Set[str]) -> bool:
             if not active_done:
                 active_tail = active_scan[-(max_target_len + 1) :]
 
-    return marker_found or (is_loopback and active_target_found) or (
-        voidstrap_marker_found and target_found
+    return (
+        marker_found
+        or (is_loopback and active_target_found)
+        or (voidstrap_marker_found and target_found)
     )
 
 
@@ -2047,9 +2085,7 @@ def repair_hosts_file(
                     return data
                 last_newline = data.rfind(b'\n')
                 complete, remainder = data[: last_newline + 1], data[last_newline + 1 :]
-                complete, blank_count = re.subn(
-                    rb'(?m)^[ \t]*(?:\r\n|\n|\r)', b'', complete
-                )
+                complete, blank_count = re.subn(rb'(?m)^[ \t]*(?:\r\n|\n|\r)', b'', complete)
                 removed_blank_lines += blank_count
                 for raw_line in complete.splitlines(keepends=True):
                     _write_repair_line(raw_line)
@@ -2202,7 +2238,9 @@ def repair_hosts_file(
     except OSError as exc:
         _record_hosts_error(error_details, exc)
         if error_details is not None:
-            error_details.update({'error_code': 'hosts_file_repair_failed', 'repair_attempted': True})
+            error_details.update(
+                {'error_code': 'hosts_file_repair_failed', 'repair_attempted': True}
+            )
         return False
     finally:
         if temp_path is not None:
@@ -2524,7 +2562,7 @@ def _find_roblox_dirs(*, include_studio: bool = True) -> list:
                 return False
             try:
                 key = str(path.resolve()).lower()
-            except (OSError, ValueError):
+            except OSError, ValueError:
                 key = str(path).lower()
             if key in seen:
                 return False
@@ -2567,12 +2605,12 @@ def _find_roblox_dirs(*, include_studio: bool = True) -> list:
                 return os.path.isfile(os.path.join(path, ROBLOX_PROCESS)) or os.path.isfile(
                     os.path.join(path, ROBLOX_STUDIO_PROCESS)
                 )
-            except (OSError, ValueError):
+            except OSError, ValueError:
                 return False
 
         try:
             root_is_dir = root.is_dir()
-        except (OSError, ValueError):
+        except OSError, ValueError:
             return results
         if root_is_dir and _has_roblox_exe(root):
             results.append(root)
@@ -2587,7 +2625,7 @@ def _find_roblox_dirs(*, include_studio: bool = True) -> list:
                         results.append(entry_path)
                     if depth < max_depth:
                         _recurse(entry_path, depth + 1)
-            except (OSError, ValueError):
+            except OSError, ValueError:
                 pass
 
         if root_is_dir:
@@ -2655,9 +2693,9 @@ def _find_roblox_dirs(*, include_studio: bool = True) -> list:
                                     _check_player_path_key(ssk)
                             except OSError, ValueError:
                                 pass
-                except (OSError, ValueError):
+                except OSError, ValueError:
                     pass
-    except (OSError, ValueError):
+    except OSError, ValueError:
         pass
     log_buffer.log(
         'Certificate',
@@ -2697,7 +2735,7 @@ def _find_roblox_dirs(*, include_studio: bool = True) -> list:
                             _add(d, 'Active Roblox protocol')
             except OSError, ValueError:
                 pass
-    except (OSError, ValueError):
+    except OSError, ValueError:
         pass
     log_buffer.log(
         'Certificate',
@@ -2748,7 +2786,7 @@ def _find_roblox_dirs(*, include_studio: bool = True) -> list:
                             _add(d, 'Active Studio protocol')
             except OSError, ValueError:
                 pass
-    except (OSError, ValueError):
+    except OSError, ValueError:
         pass
     log_buffer.log(
         'Certificate',
@@ -2773,7 +2811,9 @@ def _find_roblox_dirs(*, include_studio: bool = True) -> list:
 
     for candidate in found:
         sources = ', '.join(sorted(discovery_sources.get(str(candidate), {'unknown'})))
-        log_buffer.log('Certificate', f'  Candidate Roblox install: {candidate} (sources={sources})')
+        log_buffer.log(
+            'Certificate', f'  Candidate Roblox install: {candidate} (sources={sources})'
+        )
 
     return found
 
@@ -3853,7 +3893,11 @@ def check_and_patch_running_roblox_ca(exe_path: 'Path') -> bool:
         )
         pre_state_readable = bool(pre_state.get('exists')) and not bool(pre_state.get('error'))
         seeded = False
-        if (IS_WINDOWS or IS_LINUX) and _cacert_needs_seed(pre_state) and not pre_state.get('error'):
+        if (
+            (IS_WINDOWS or IS_LINUX)
+            and _cacert_needs_seed(pre_state)
+            and not pre_state.get('error')
+        ):
             seed_dirs = _find_roblox_dirs(include_studio=False)
             if roblox_dir not in seed_dirs:
                 seed_dirs.insert(0, roblox_dir)
@@ -4037,6 +4081,12 @@ class ProxyMaster:
             self.config_manager.settings.get('_runtime_proxy_debug_mode', 'full') or 'full'
         ).lower()
         return mode if mode in {'a', 'b', 'c', 'd', 'e', 'full'} else 'full'
+
+    def _use_splice_transport(self) -> bool:
+        if not IS_WINDOWS:
+            return False
+        setting = os.environ.get('FLEASION_SPLICE', '1').strip().lower()
+        return setting not in {'0', 'false', 'no', 'off'}
 
     def _effective_upstream_mode(self) -> str:
         if self._proxy_debug_enabled() and self._proxy_debug_mode() == 'e':
@@ -4424,6 +4474,7 @@ class ProxyMaster:
         if (
             custom_modifier is not None
             and custom_modifier.is_enabled()
+            and not IS_WINDOWS
             and self._linux_sober_custom_fflag_routes_ready()
         ):
             hosts.update(CUSTOM_FFLAGS_INTERCEPT_HOSTS)
@@ -5127,10 +5178,32 @@ class ProxyMaster:
             self._tls_startup_attempts = []
             return True
 
-        if not IS_WINDOWS:
-            ok = await _run_tls_self_test(
-                hosts, ca_cert_path, port, explicit_proxy=explicit_proxy
+        if getattr(self._proxy, '_tls_splice', False):
+            ok, failures = await _splice_connect_probe_result(hosts, port)
+            self._tls_startup_attempts = [
+                {
+                    'loopback': '127.0.0.1',
+                    'mode': 'splice_connect',
+                    'ok': ok,
+                    'failures': failures,
+                }
+            ]
+            if not ok:
+                log_buffer.log(
+                    'TLS',
+                    'Startup TLS splice transport probe failed: ' + '; '.join(failures),
+                )
+                return False
+            log_buffer.log(
+                'TLS',
+                'Startup TLS splice transport probe passed for '
+                f'{format_count(hosts, "intercept host")} '
+                '(CONNECT/upstream only; live client traffic is required to test decryption)',
             )
+            return True
+
+        if not IS_WINDOWS:
+            ok = await _run_tls_self_test(hosts, ca_cert_path, port, explicit_proxy=explicit_proxy)
             self._tls_startup_attempts = [
                 {
                     'loopback': '127.0.0.1',
@@ -5687,6 +5760,7 @@ class ProxyMaster:
             intercept_all_hosts=getattr(self, '_env_proxy_intercept_all', False),
             intercept_excluded_hosts=env_proxy_intercept_excluded_hosts,
             auto_replace_rules=self.get_auto_replace_rules(),
+            tls_splice=self._use_splice_transport(),
             ca_cert_path=ca_cert_path,
             ca_key_path=ca_key_path,
             cert_cache_dir=proxy_ca_dir,
@@ -6108,9 +6182,7 @@ class ProxyMaster:
                 stop_helper()
             else:
                 rollback_details: dict = {}
-                if not _remove_hosts_entries(
-                    set(INTERCEPT_HOSTS), error_details=rollback_details
-                ):
+                if not _remove_hosts_entries(set(INTERCEPT_HOSTS), error_details=rollback_details):
                     log_buffer.log(
                         'Error',
                         'Proxy startup rollback could not remove Fleasion hosts entries: '

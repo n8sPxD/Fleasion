@@ -8,6 +8,8 @@ from types import SimpleNamespace
 
 import pytest
 
+from fleasion.proxy import server as proxy_server
+from fleasion.proxy.h2_transport import _as_http1
 from fleasion.proxy.server import (
     ASSET_DELIVERY_HOST,
     PROFILE_API_HOST,
@@ -19,7 +21,12 @@ from fleasion.proxy.server import (
     _read_headers_raw,
     _serve_local_file,
 )
-from fleasion.proxy.upstream import AutoConnector, UpstreamConnectResult, UpstreamEndpoint
+from fleasion.proxy.upstream import (
+    AutoConnector,
+    HttpProxyConfig,
+    UpstreamConnectResult,
+    UpstreamEndpoint,
+)
 from fleasion.utils.certs import generate_ca, generate_host_cert, generate_multi_host_cert
 
 
@@ -102,7 +109,65 @@ def test_upstream_self_test_serializes_and_fully_closes_probes():
     ]
 
 
+def test_explicit_tunnel_prefers_system_http_connect(monkeypatch):
+    calls = []
+
+    def connect_through_proxy(*args):
+        calls.append(args)
+        return object()
+
+    async def fake_open_connection(*_args, **_kwargs):
+        return object(), object()
+
+    monkeypatch.setattr(proxy_server, '_blocking_http_connect_socket', connect_through_proxy)
+    monkeypatch.setattr(proxy_server.asyncio, 'open_connection', fake_open_connection)
+    proxy = FleasionProxy.__new__(FleasionProxy)
+    proxy._system_http_connector = SimpleNamespace(
+        proxy=HttpProxyConfig(host='127.0.0.1', port=7890)
+    )
+
+    result = asyncio.run(proxy._open_routed_explicit_proxy_tunnel('apis.roblox.com', 443))
+
+    assert result.writer is not None
+    assert result.endpoint == 'system_http_connect 127.0.0.1:7890->apis.roblox.com:443'
+    assert calls == [
+        (
+            '127.0.0.1',
+            7890,
+            'apis.roblox.com',
+            443,
+            proxy_server._EXPLICIT_TUNNEL_CONNECT_TIMEOUT,
+            None,
+            None,
+        )
+    ]
+
+
 class ProxyServerRawHttpTests(unittest.TestCase):
+    def test_h2_response_gets_http1_content_length_framing(self):
+        body = b'x' * 8813
+        message = _as_http1(
+            [(b':status', b'200'), (b'content-type', b'application/octet-stream')],
+            body,
+            request=False,
+            request_method=b'POST',
+        )
+
+        headers, parsed_body = asyncio.run(_read_message(message))
+
+        self.assertEqual(headers.headers[b'content-length'], str(len(body)).encode())
+        self.assertEqual(parsed_body.payload, body)
+
+    def test_h2_bodyless_response_does_not_get_http1_content_length_framing(self):
+        message = _as_http1(
+            [(b':status', b'204')],
+            b'',
+            request=False,
+            request_method=b'POST',
+        )
+
+        self.assertNotIn(b'content-length:', message.split(b'\r\n\r\n', 1)[0].lower())
+
     def test_raw_header_preservation_duplicate_headers_and_casing(self):
         data = (
             b'GET /asset HTTP/1.1\r\n'

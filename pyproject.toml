@@ -18,6 +18,7 @@ dependencies = [
     'pyqt6-qt6==6.7.3; sys_platform == "darwin"',
     'pyqt6>=6.8.0; sys_platform != "darwin"',
     'python-dateutil>=2.9.0',
+    'h2>=4.2,<5',
     'platformdirs>=4.0.0',
     'sounddevice>=0.5.6',
     'soundfile>=0.13.1',
