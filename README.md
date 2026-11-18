@@ -1,10 +1,14 @@
 > [!IMPORTANT]
-> Roblox has patched Fleasion and it currently does not work. There is **no ETA** for a fix.
+> This is a small compatibility fork of Fleasion. It adapts the Windows client path in the current `main` codebase to a recent Roblox Player using live TLS splice and HTTP/2 support. Live validation is currently focused on **Phantom Forces**; other games have not been systematically tested.
 
 > [!CAUTION]
-> Official Fleasion downloads are published only on this repository's [Releases](https://github.com/fleasion/Fleasion/releases) page. The official website is [fleasion.github.io](https://fleasion.github.io/), and the official community is our [Discord server](https://discord.gg/hXyhKehEZF).
+> Compatibility builds from this fork are published on its [Releases](https://github.com/n8sPxD/Fleasion/releases) page. The official Fleasion project, website, and community remain at [fleasion/Fleasion](https://github.com/fleasion/Fleasion) and [fleasion.github.io](https://fleasion.github.io/).
+
+The original Fleasion authors deserve the credit for the application and for the active `feat/rewrite-ui-v2` rewrite work. This fork is intentionally narrower: it brings selected compatibility changes to the older `main` codebase for a small group of users while the upstream rewrite continues separately.
 
 # Fleasion
+
+**English** | [简体中文](README.zh-CN.md)
 
 Fleasion replaces Roblox game assets in real time on Windows, macOS and Linux (Sober). It runs a local proxy between Roblox and its servers, so you can swap textures, audio, meshes, animations and other assets before they reach the game client.
 
@@ -16,7 +20,7 @@ For help or content requests, join our Discord server.
 
 ## Installation
 
-Download the latest build from the [Releases](https://github.com/fleasion/Fleasion/releases) page. Python is not required.
+Download the latest compatibility build from this fork's [Releases](https://github.com/n8sPxD/Fleasion/releases) page. Python is not required.
 
 To run Fleasion from source, build it, or contribute code, see [CONTRIBUTING.md](CONTRIBUTING.md).
 
@@ -99,11 +103,11 @@ Env Proxy runs the Fleasion app and proxy as your normal user on every platform.
 <details>
 <summary><b>Certificates and FastFlags</b></summary>
 
-Fleasion sets `DFFlagHttpUseEmbeddedCaCerts=False` on every platform so Roblox trusts the patched `ssl/cacert.pem` bundle. This override and its refresh interval are delivered through ClientSettings responses even when custom FastFlags are off. Windows and macOS also receive them in their startup settings.
+Windows uses the live TLS splice transport: Roblox keeps its original certificate chain, Fleasion recovers only the local process's TLS session keys, and ClientSettings remains an end-to-end tunnel so its response signature is preserved. Other platforms set `DFFlagHttpUseEmbeddedCaCerts=False` so Roblox trusts the patched `ssl/cacert.pem` bundle, and receive that override with its refresh interval through ClientSettings responses even when custom FastFlags are off.
 
 Sober's pinned bootstrap requests stay tunneled, and Linux interception starts after Sober's existing bootstrap delay. These internal overrides do not appear in your saved FastFlag list, and certificate verification stays on.
 
-When custom FastFlags are on, Fleasion merges your overrides into ClientSettings responses and pre-fills the platform startup settings, so flags that Roblox reads early in startup apply immediately.
+When custom FastFlags are on, Windows pre-fills its startup flag cache; other platforms also merge overrides into ClientSettings responses. This keeps flags that Roblox reads early in startup available immediately. Windows dynamic ClientSettings overrides remain disabled while Roblox verifies signed responses.
 
 </details>
 
