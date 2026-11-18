@@ -9,14 +9,19 @@ import hashlib
 import io
 import json
 import logging
+import os
+import re
+import secrets
 import time
+from collections import OrderedDict
 from pathlib import Path
 from threading import Lock, Thread
 from typing import Dict, Optional, Tuple
-from urllib.parse import urlparse
+from urllib.parse import parse_qsl, urlparse, urlsplit
 
 from ...utils import APP_CACHE_DIR, format_count, log_buffer
 from ...utils.http import http_download_to
+from ..asset_delivery import batch_response_locations
 from ..roblox_metadata import strip_roblox_metadata
 
 # Use orjson when available (2-3x faster JSON parse)
@@ -41,6 +46,32 @@ logger = logging.getLogger(__name__)
 
 _ZSTD_MAGIC = b'\x28\xb5\x2f\xfd'
 _GZIP_MAGIC = b'\x1f\x8b'
+_SYNTHETIC_CDN_PATH_PREFIX = '/__fleasion__/asset/'
+_SYNTHETIC_CDN_ROUTE_LIMIT = 8192
+_SYNTHETIC_CDN_HOSTS = frozenset({'fts.rbxcdn.com', 'contentdelivery.roblox.com'})
+
+
+def is_synthetic_cdn_request(host: str, path: str) -> bool:
+    """Identify proxy-owned CDN paths, including stale or malformed tokens."""
+    return host.lower() in _SYNTHETIC_CDN_HOSTS and path.split('?', 1)[0].startswith(
+        _SYNTHETIC_CDN_PATH_PREFIX
+    )
+
+
+def _synthetic_cdn_host(url: str) -> Optional[str]:
+    """Require a trusted CDN HTTPS origin for a synthetic response URL."""
+    try:
+        location = urlsplit(url)
+        if location.scheme != 'https' or location.hostname not in _SYNTHETIC_CDN_HOSTS:
+            return None
+        if location.username is not None or location.password is not None:
+            return None
+        if location.port not in (None, 443) or location.fragment:
+            return None
+    except ValueError:
+        return None
+    return location.hostname
+
 
 _TEXPACK_SLOT_NAMES = {
     0: 'Color',
@@ -423,6 +454,7 @@ class TextureStripper:
     _solidmodel_injections: Dict[str, str] = {}  # base_cdn_url -> obj_path
     _solidmodel_force_v3: set = set()  # base_cdn_url values that should force v3 CSG export
     _batch_generations: Dict[str, int] = {}  # batch_id -> route generation
+    _synthetic_routes: OrderedDict[str, Tuple[str, str]] = OrderedDict()
     _routes_generation: int = 0
 
     ASSET_TYPES: Dict[int, str] = {
@@ -512,6 +544,9 @@ class TextureStripper:
         self._seen_replacements_generation = getattr(
             config_manager, 'replacements_generation', None
         )
+        self._synthetic_cdn_enabled = os.environ.get(
+            'FLEASION_ASSET_SYNTHETIC_CDN', ''
+        ).strip().lower() in {'1', 'true', 'yes'}
 
     @classmethod
     def reset_routes(cls, reason: str = '') -> dict[str, int]:
@@ -523,6 +558,7 @@ class TextureStripper:
                 'cdn': len(cls._cdn_redirects),
                 'solid': len(cls._solidmodel_injections),
                 'batches': len(cls._batch_generations),
+                'synthetic': len(cls._synthetic_routes),
             }
             cls._pending.clear()
             cls._local_redirects.clear()
@@ -530,6 +566,7 @@ class TextureStripper:
             cls._solidmodel_injections.clear()
             cls._solidmodel_force_v3.clear()
             cls._batch_generations.clear()
+            cls._synthetic_routes.clear()
             cls._routes_generation += 1
         with cls._anim_lock:
             counts['anim_pending'] = len(cls._anim_local_pending)
@@ -1190,6 +1227,73 @@ class TextureStripper:
         mapped = self._REVERSE.get(at_name)
         return mapped in self._ANIM_TYPE_IDS
 
+    @staticmethod
+    def rewrite_direct_asset_id(path: str, replacements_tuple: tuple) -> str:
+        """Apply exact ID swaps to unbatched asset-delivery requests."""
+        parsed = urlparse(path)
+        id_path = re.fullmatch(r'/v[12]/assetId/([0-9]+)/?', parsed.path)
+        if id_path is not None:
+            if any(key == 'id' for key, _ in parse_qsl(parsed.query, keep_blank_values=True)):
+                return path
+            original_id = int(id_path.group(1))
+            start, end = id_path.span(1)
+        else:
+            if parsed.path.rstrip('/') not in ('/v1/asset', '/v2/asset'):
+                return path
+            matches = list(re.finditer(r'([?&])id=([0-9]+)(?=&|$)', path))
+            if len(matches) != 1:
+                return path
+            match = matches[0]
+            ids = [
+                value
+                for key, value in parse_qsl(parsed.query, keep_blank_values=True)
+                if key == 'id'
+            ]
+            if ids != [match.group(2)]:
+                return path
+            original_id = int(match.group(2))
+            start, end = match.span(2)
+
+        replacements, removals, cdn_replacements, local_replacements = replacements_tuple
+        if (
+            original_id in removals
+            or original_id in local_replacements
+            or original_id in cdn_replacements
+        ):
+            return path
+        replacement_id = replacements.get(original_id)
+        if (
+            replacement_id is None
+            or replacement_id in (0, 1, original_id)
+            or replacement_id in TextureStripper._predownloaded
+        ):
+            return path
+        return f'{path[:start]}{replacement_id}{path[end:]}'
+
+    def _issue_synthetic_location_locked(self, item: dict, kind: str, target: str) -> bool:
+        """Assign a request-specific CDN URL for one replacement representation."""
+        locations = batch_response_locations(item)
+        if len(locations) != 1 or kind not in ('local', 'cdn'):
+            return False
+        host = _synthetic_cdn_host(locations[0])
+        if host is None:
+            return False
+        synthetic_path = f'{_SYNTHETIC_CDN_PATH_PREFIX}{secrets.token_hex(24)}'
+        synthetic_url = f'https://{host}{synthetic_path}'
+        plural = item.get('locations')
+        if isinstance(item.get('location'), str) and isinstance(plural, list):
+            return False
+        if isinstance(plural, list):
+            if len(plural) != 1 or not isinstance(plural[0], dict):
+                return False
+            plural[0]['location'] = synthetic_url
+        else:
+            item['location'] = synthetic_url
+        self._synthetic_routes[synthetic_url] = (kind, target)
+        while len(self._synthetic_routes) > _SYNTHETIC_CDN_ROUTE_LIMIT:
+            self._synthetic_routes.popitem(last=False)
+        return True
+
     # Batch request (called from server MITM thread)
 
     def process_batch_request(
@@ -1681,7 +1785,7 @@ class TextureStripper:
 
     def process_batch_response(
         self, req_body: bytes, resp_body: bytes, req_headers: dict, batch_id: str = ''
-    ) -> None:
+    ) -> Optional[bytes]:
         """Commit CDN URL -> redirect/local/solid mappings from batch response."""
         if not resp_body:
             return
@@ -1759,15 +1863,25 @@ class TextureStripper:
         _texpack_request_slots = self._build_texpack_request_slot_map(req_data, _slot_target_ids)
 
         with self._lock:
+            original_locations = (
+                tuple(
+                    batch_response_locations(item) for item in resp_data if isinstance(item, dict)
+                )
+                if self._synthetic_cdn_enabled
+                else ()
+            )
             batch_generation = self._batch_generations.pop(batch_id, None)
             if batch_generation is None or batch_generation != self._routes_generation:
-                return
+                return None
             for idx, item in enumerate(resp_data):
                 if not isinstance(item, dict):
                     continue
                 req_id_raw = str(item.get('requestId', ''))
-                location = item.get('location')
-                base_loc = location.split('?')[0] if location else ''
+                base_locs = tuple(
+                    dict.fromkeys(
+                        url.split('?')[0] for url in batch_response_locations(item) if url
+                    )
+                )
 
                 pending_key = ''
                 if req_id_raw:
@@ -1789,7 +1903,7 @@ class TextureStripper:
                 aid = self._normalize_asset_id(req_item.get('assetId'))
                 map_index = _texpack_request_slots.get(idx)
 
-                if location and not pending_key:
+                if base_locs and not pending_key:
                     if aid is not None and map_index is not None:
                         if map_index == 2 and _orm_overrides:
                             _orm_chs: dict[str, str | None] = {}
@@ -1806,10 +1920,17 @@ class TextureStripper:
                                     normal_source=_normal_source,
                                 )
                                 if _comp:
-                                    self._local_redirects[base_loc] = _comp
+                                    if not (
+                                        self._synthetic_cdn_enabled
+                                        and self._issue_synthetic_location_locked(
+                                            item, 'local', _comp
+                                        )
+                                    ):
+                                        for base_loc in base_locs:
+                                            self._local_redirects[base_loc] = _comp
                                     log_buffer.log(
                                         'Local',
-                                        f'Will serve local for {base_loc[:60]}... '
+                                        f'Will serve local for {base_locs[0][:60]}... '
                                         f'(key=ORM[{", ".join(sorted(_orm_chs))}], slot={map_index}, file={Path(_comp).name})',
                                     )
                                     continue
@@ -1827,27 +1948,44 @@ class TextureStripper:
                                 local_replacements[local_key],
                                 map_index=map_index,
                             )
-                            self._local_redirects[base_loc] = local_path
+                            if not (
+                                self._synthetic_cdn_enabled
+                                and self._issue_synthetic_location_locked(item, 'local', local_path)
+                            ):
+                                for base_loc in base_locs:
+                                    self._local_redirects[base_loc] = local_path
                             log_buffer.log(
                                 'Local',
-                                f'Will serve local for {base_loc[:60]}... '
+                                f'Will serve local for {base_locs[0][:60]}... '
                                 f'(key={local_key}, slot={map_index}, file={Path(local_path).name})',
                             )
                             continue
                         if cdn_key is not None:
-                            self._cdn_redirects[base_loc] = cdn_replacements[cdn_key]
+                            if not (
+                                self._synthetic_cdn_enabled
+                                and self._issue_synthetic_location_locked(
+                                    item, 'cdn', cdn_replacements[cdn_key]
+                                )
+                            ):
+                                for base_loc in base_locs:
+                                    self._cdn_redirects[base_loc] = cdn_replacements[cdn_key]
                             log_buffer.log(
                                 'CDN',
-                                f'Will redirect {base_loc[:60]}... (key={cdn_key}, slot={map_index})',
+                                f'Will redirect {base_locs[0][:60]}... (key={cdn_key}, slot={map_index})',
                             )
                             continue
 
-                if not location or not pending_key:
+                if not base_locs or not pending_key:
                     continue
                 url_type, url_value = self._pending.pop(pending_key)
                 if url_type == 'cdn':
-                    self._cdn_redirects[base_loc] = url_value
-                    log_buffer.log('CDN', f'Will redirect {base_loc[:60]}...')
+                    if not (
+                        self._synthetic_cdn_enabled
+                        and self._issue_synthetic_location_locked(item, 'cdn', url_value)
+                    ):
+                        for base_loc in base_locs:
+                            self._cdn_redirects[base_loc] = url_value
+                    log_buffer.log('CDN', f'Will redirect {base_locs[0][:60]}...')
                 elif url_type == 'local':
                     # Check if this is a tagged animation replacement — if so, put it in
                     # _anim_rig_local so server.py reads the upstream CDN response first
@@ -1856,19 +1994,33 @@ class TextureStripper:
                         _anim_pending = self._anim_local_pending.pop(pending_key, None)
                     if _anim_pending is not None:
                         _anim_path, _required_rig = _anim_pending
-                        self._anim_rig_local[base_loc] = (_anim_path, _required_rig)
-                        log_buffer.log('AnimConv', f'Queued rig-detect for {base_loc[:60]}...')
+                        for base_loc in base_locs:
+                            self._anim_rig_local[base_loc] = (_anim_path, _required_rig)
+                        log_buffer.log('AnimConv', f'Queued rig-detect for {base_locs[0][:60]}...')
                     else:
-                        self._local_redirects[base_loc] = url_value
-                        log_buffer.log('Local', f'Will serve local for {base_loc[:60]}...')
+                        if not (
+                            self._synthetic_cdn_enabled
+                            and self._issue_synthetic_location_locked(item, 'local', url_value)
+                        ):
+                            for base_loc in base_locs:
+                                self._local_redirects[base_loc] = url_value
+                        log_buffer.log('Local', f'Will serve local for {base_locs[0][:60]}...')
                 elif url_type == 'solid':
-                    self._solidmodel_injections[base_loc] = url_value
-                    self._solidmodel_force_v3.discard(base_loc)
-                    log_buffer.log('SolidModel', f'Will inject OBJ for {base_loc[:60]}...')
+                    for base_loc in base_locs:
+                        self._solidmodel_injections[base_loc] = url_value
+                    self._solidmodel_force_v3.difference_update(base_locs)
+                    log_buffer.log('SolidModel', f'Will inject OBJ for {base_locs[0][:60]}...')
                 elif url_type == 'solid_obj':
-                    self._solidmodel_injections[base_loc] = url_value
-                    self._solidmodel_force_v3.add(base_loc)
-                    log_buffer.log('SolidModel', f'Will inject OBJ for {base_loc[:60]}...')
+                    for base_loc in base_locs:
+                        self._solidmodel_injections[base_loc] = url_value
+                    self._solidmodel_force_v3.update(base_locs)
+                    log_buffer.log('SolidModel', f'Will inject OBJ for {base_locs[0][:60]}...')
+            if self._synthetic_cdn_enabled and original_locations != tuple(
+                batch_response_locations(item) for item in resp_data if isinstance(item, dict)
+            ):
+                rewritten = _dumps(resp_data)
+                return rewritten if rewritten != resp_body else None
+        return None
 
     # CDN request check (called from server MITM thread for Roblox CDN hosts)
 
@@ -1881,7 +2033,16 @@ class TextureStripper:
         """
         self._sync_replacements_generation()
         base_url = f'https://{host}{path}'.split('?')[0]
+        if is_synthetic_cdn_request(host, path):
+            with self._lock:
+                entry = self._synthetic_routes.get(base_url)
+                if entry is not None:
+                    self._synthetic_routes.move_to_end(base_url)
+                return entry
 
+        return self._check_legacy_cdn_request(base_url)
+
+    def _check_legacy_cdn_request(self, base_url: str) -> Optional[Tuple[str, str]]:
         def _log_cdn_match(action: str, value) -> None:
             try:
                 target = value[0] if action == 'anim_rig' and isinstance(value, tuple) else value

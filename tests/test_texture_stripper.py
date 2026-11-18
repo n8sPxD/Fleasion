@@ -1,6 +1,8 @@
 import json
 from unittest.mock import patch
 
+import pytest
+
 from fleasion.proxy.addons.texture_stripper import TextureStripper, _decode_texpack_slot_quality
 
 
@@ -13,52 +15,107 @@ def setup_function():
     TextureStripper.reset_routes()
 
 
+@pytest.mark.parametrize(
+    ('path', 'expected'),
+    [
+        ('/v1/asset/?id=12345', '/v1/asset/?id=98765'),
+        (
+            '/v1/asset/?client=studio&id=12345&token=opaque',
+            '/v1/asset/?client=studio&id=98765&token=opaque',
+        ),
+        ('/v2/assetId/12345?format=source', '/v2/assetId/98765?format=source'),
+        ('/v1/asset/?id=12345&id=67890', '/v1/asset/?id=12345&id=67890'),
+        ('/v1/assets/batch?id=12345', '/v1/assets/batch?id=12345'),
+    ],
+)
+def test_direct_exact_id_rewrite_preserves_query(path, expected):
+    assert (
+        TextureStripper.rewrite_direct_asset_id(path, ({12345: 98765}, set(), {}, {})) == expected
+    )
+
+
+def test_synthetic_cdn_route_rewrites_local_location(monkeypatch, tmp_path):
+    monkeypatch.setenv('FLEASION_ASSET_SYNTHETIC_CDN', '1')
+    replacement = tmp_path / 'replacement.ogg'
+    replacement.write_bytes(b'replacement-audio')
+    replacements = ({}, set(), {}, {1234: str(replacement)})
+
+    class _LocalConfig:
+        def get_all_replacements(self):
+            return replacements
+
+    stripper = TextureStripper(_LocalConfig())
+    request = json.dumps([{'assetId': 1234, 'requestId': 'A'}]).encode()
+    stripper.process_batch_request(request, {}, replacements, 'synthetic')
+    response = json.dumps(
+        [
+            {
+                'requestId': 'A',
+                'location': 'https://contentdelivery.roblox.com/v1/bytes/original',
+            }
+        ]
+    ).encode()
+
+    rewritten = stripper.process_batch_response(request, response, {}, 'synthetic')
+
+    assert rewritten is not None
+    location = json.loads(rewritten)[0]['location']
+    assert '/__fleasion__/asset/' in location
+    assert stripper.check_cdn_request(
+        'contentdelivery.roblox.com', location.split('https://contentdelivery.roblox.com', 1)[1]
+    ) == ('local', str(replacement))
+
+
 def test_batch_request_ignores_dummy_id_replacements():
     stripper = TextureStripper(_Config())
-    body = json.dumps([
-        {"assetId": 100, "requestId": "a"},
-        {"assetId": 101, "requestId": "b"},
-        {"assetId": 102, "requestId": "c"},
-    ]).encode()
+    body = json.dumps(
+        [
+            {'assetId': 100, 'requestId': 'a'},
+            {'assetId': 101, 'requestId': 'b'},
+            {'assetId': 102, 'requestId': 'c'},
+        ]
+    ).encode()
 
     modified, scraper_body = stripper.process_batch_request(
         body,
         {},
         ({100: 0, 101: 1, 102: 999}, set(), {}, {}),
-        "batch",
+        'batch',
     )
 
     assert json.loads(modified) == [
-        {"assetId": 100, "requestId": "a"},
-        {"assetId": 101, "requestId": "b"},
-        {"assetId": 999, "requestId": "c"},
+        {'assetId': 100, 'requestId': 'a'},
+        {'assetId': 101, 'requestId': 'b'},
+        {'assetId': 999, 'requestId': 'c'},
     ]
     assert json.loads(scraper_body) == [
-        {"assetId": 100, "requestId": "a"},
-        {"assetId": 101, "requestId": "b"},
-        {"assetId": 102, "requestId": "c"},
+        {'assetId': 100, 'requestId': 'a'},
+        {'assetId': 101, 'requestId': 'b'},
+        {'assetId': 102, 'requestId': 'c'},
     ]
 
 
 def test_exact_id_replacement_takes_priority_over_type_removal():
     stripper = TextureStripper(_Config())
-    body = json.dumps([
-        {"assetId": 1234, "assetType": "TexturePack", "assetTypeId": 63, "requestId": "a"},
-        {"assetId": 5678, "assetType": "TexturePack", "assetTypeId": 63, "requestId": "b"},
-    ]).encode()
+    body = json.dumps(
+        [
+            {'assetId': 1234, 'assetType': 'TexturePack', 'assetTypeId': 63, 'requestId': 'a'},
+            {'assetId': 5678, 'assetType': 'TexturePack', 'assetTypeId': 63, 'requestId': 'b'},
+        ]
+    ).encode()
 
     modified, scraper_body = stripper.process_batch_request(
         body,
         {},
         ({1234: 999}, {63}, {}, {}),
-        "batch",
+        'batch',
     )
 
     assert json.loads(modified) == [
-        {"assetId": 999, "assetType": "TexturePack", "assetTypeId": 63, "requestId": "a"},
+        {'assetId': 999, 'assetType': 'TexturePack', 'assetTypeId': 63, 'requestId': 'a'},
     ]
     assert json.loads(scraper_body) == [
-        {"assetId": 1234, "assetType": "TexturePack", "assetTypeId": 63, "requestId": "a"},
+        {'assetId': 1234, 'assetType': 'TexturePack', 'assetTypeId': 63, 'requestId': 'a'},
     ]
 
 
@@ -70,40 +127,46 @@ def test_cdn_replacement_takes_priority_over_type_removal(monkeypatch):
         '_route_cdn',
         lambda *args, **kwargs: routed.append((args, kwargs)),
     )
-    body = json.dumps([
-        {"assetId": 1234, "assetType": "TexturePack", "assetTypeId": 63, "requestId": "a"},
-    ]).encode()
+    body = json.dumps(
+        [
+            {'assetId': 1234, 'assetType': 'TexturePack', 'assetTypeId': 63, 'requestId': 'a'},
+        ]
+    ).encode()
 
     modified, _ = stripper.process_batch_request(
         body,
         {},
-        ({}, {63}, {1234: "https://example.com/custom.png"}, {}),
-        "batch",
+        ({}, {63}, {1234: 'https://example.com/custom.png'}, {}),
+        'batch',
     )
 
-    assert json.loads(modified)[0]["assetId"] == 1234
-    assert routed and routed[0][0][2] == "https://example.com/custom.png"
-    assert routed[0][1]["map_index"] is None
+    assert json.loads(modified)[0]['assetId'] == 1234
+    assert routed and routed[0][0][2] == 'https://example.com/custom.png'
+    assert routed[0][1]['map_index'] is None
 
 
 def test_local_replacement_takes_priority_over_type_removal(monkeypatch, tmp_path):
     stripper = TextureStripper(_Config())
     routed = []
-    monkeypatch.setattr(stripper, '_route_local', lambda *args, **kwargs: routed.append((args, kwargs)))
-    replacement = tmp_path / "custom.png"
-    replacement.write_bytes(b"png")
-    body = json.dumps([
-        {"assetId": 1234, "assetType": "TexturePack", "assetTypeId": 63, "requestId": "a"},
-    ]).encode()
+    monkeypatch.setattr(
+        stripper, '_route_local', lambda *args, **kwargs: routed.append((args, kwargs))
+    )
+    replacement = tmp_path / 'custom.png'
+    replacement.write_bytes(b'png')
+    body = json.dumps(
+        [
+            {'assetId': 1234, 'assetType': 'TexturePack', 'assetTypeId': 63, 'requestId': 'a'},
+        ]
+    ).encode()
 
     modified, _ = stripper.process_batch_request(
         body,
         {},
         ({}, {63}, {}, {1234: str(replacement)}),
-        "batch",
+        'batch',
     )
 
-    assert json.loads(modified)[0]["assetId"] == 1234
+    assert json.loads(modified)[0]['assetId'] == 1234
     assert routed and routed[0][0][2] == str(replacement)
 
 
@@ -114,11 +177,13 @@ def test_whole_texturepack_id_replacement_swaps_parent_without_downloading_xml()
 
     stripper = TextureStripper(_Config())
     stripper.set_cache_scraper(_Scraper())
-    body = json.dumps([
-        _texpack_request(1234, 'color', 'color-fidelity'),
-        _texpack_request(1234, 'normal', 'normal-fidelity'),
-        _texpack_request(1234, 'orm', 'orm-fidelity'),
-    ]).encode()
+    body = json.dumps(
+        [
+            _texpack_request(1234, 'color', 'color-fidelity'),
+            _texpack_request(1234, 'normal', 'normal-fidelity'),
+            _texpack_request(1234, 'orm', 'orm-fidelity'),
+        ]
+    ).encode()
 
     modified, scraper_body = stripper.process_batch_request(
         body,
@@ -139,11 +204,13 @@ def test_predownloaded_texturepack_xml_is_not_served_as_slot_content(tmp_path):
         b'<color>10</color><normal>11</normal></roblox>'
     )
     stripper._predownloaded = {9999: str(manifest)}
-    body = json.dumps([
-        _texpack_request(1234, 'color', 'color-fidelity'),
-        _texpack_request(1234, 'normal', 'normal-fidelity'),
-        _texpack_request(1234, 'orm', 'orm-fidelity'),
-    ]).encode()
+    body = json.dumps(
+        [
+            _texpack_request(1234, 'color', 'color-fidelity'),
+            _texpack_request(1234, 'normal', 'normal-fidelity'),
+            _texpack_request(1234, 'orm', 'orm-fidelity'),
+        ]
+    ).encode()
 
     modified, _ = stripper.process_batch_request(
         body,
@@ -159,13 +226,17 @@ def test_predownloaded_texturepack_xml_is_not_served_as_slot_content(tmp_path):
 def test_exact_local_texturepack_rule_overrides_type_id_rule(monkeypatch, tmp_path):
     stripper = TextureStripper(_Config())
     routed = []
-    monkeypatch.setattr(stripper, '_route_local', lambda *args, **kwargs: routed.append((args, kwargs)))
+    monkeypatch.setattr(
+        stripper, '_route_local', lambda *args, **kwargs: routed.append((args, kwargs))
+    )
     fish = tmp_path / 'fish.png'
     fish.write_bytes(b'png')
-    body = json.dumps([
-        _texpack_request(14108663921, 'carpet-color', 'color-fidelity'),
-        _texpack_request(2222, 'wall-color', 'color-fidelity'),
-    ]).encode()
+    body = json.dumps(
+        [
+            _texpack_request(14108663921, 'carpet-color', 'color-fidelity'),
+            _texpack_request(2222, 'wall-color', 'color-fidelity'),
+        ]
+    ).encode()
 
     modified, scraper_body = stripper.process_batch_request(
         body,
@@ -187,18 +258,30 @@ def test_exact_local_texturepack_rule_overrides_type_id_rule(monkeypatch, tmp_pa
 
 def _texpack_request(asset_id, request_id, crpl):
     return {
-        "assetId": asset_id,
-        "contentRepresentationPriorityList": crpl,
-        "doNotFallbackToBaselineRepresentation": "true",
-        "assetType": "TexturePack",
-        "requestId": str(request_id),
+        'assetId': asset_id,
+        'contentRepresentationPriorityList': crpl,
+        'doNotFallbackToBaselineRepresentation': 'true',
+        'assetType': 'TexturePack',
+        'requestId': str(request_id),
     }
 
 
 def test_texturepack_fidelity_decodes_slot_and_quality():
-    assert _decode_texpack_slot_quality(_texpack_request(1, 0, "W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6IkFFQT0ifV0=")) == (0, 1)
-    assert _decode_texpack_slot_quality(_texpack_request(1, 0, "W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6IklFQT0ifV0=")) == (1, 1)
-    assert _decode_texpack_slot_quality(_texpack_request(1, 0, "W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6IlFFQT0ifV0=")) == (2, 1)
+    assert _decode_texpack_slot_quality(
+        _texpack_request(
+            1, 0, 'W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6IkFFQT0ifV0='
+        )
+    ) == (0, 1)
+    assert _decode_texpack_slot_quality(
+        _texpack_request(
+            1, 0, 'W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6IklFQT0ifV0='
+        )
+    ) == (1, 1)
+    assert _decode_texpack_slot_quality(
+        _texpack_request(
+            1, 0, 'W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6IlFFQT0ifV0='
+        )
+    ) == (2, 1)
 
 
 def test_texturepack_partial_batch_uses_fidelity_before_occurrence_order():
@@ -207,12 +290,12 @@ def test_texturepack_partial_batch_uses_fidelity_before_occurrence_order():
         _texpack_request(
             88088208586015,
             7,
-            "W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6IlFJQT0ifSx7ImZvcm1hdCI6Imt0eDIiLCJtYWpvclZlcnNpb24iOiI2cmRvIiwiZmlkZWxpdHkiOiJnZ0E9In1d",
+            'W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6IlFJQT0ifSx7ImZvcm1hdCI6Imt0eDIiLCJtYWpvclZlcnNpb24iOiI2cmRvIiwiZmlkZWxpdHkiOiJnZ0E9In1d',
         ),
         _texpack_request(
             88088208586015,
             8,
-            "W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6IklJQT0ifSx7ImZvcm1hdCI6Imt0eDIiLCJtYWpvclZlcnNpb24iOiI2cmRvIiwiZmlkZWxpdHkiOiJnUUE9In1d",
+            'W3siZm9ybWF0Ijoia3R4MiIsIm1ham9yVmVyc2lvbiI6IjdyZG8iLCJmaWRlbGl0eSI6IklJQT0ifSx7ImZvcm1hdCI6Imt0eDIiLCJtYWpvclZlcnNpb24iOiI2cmRvIiwiZmlkZWxpdHkiOiJnUUE9In1d',
         ),
     ]
 
@@ -223,12 +306,12 @@ def test_texturepack_partial_batch_uses_fidelity_before_occurrence_order():
 
 
 def test_animation_replacement_rig_detection_strips_bin_metadata(tmp_path):
-    replacement = tmp_path / "replacement.bin"
-    replacement.write_bytes(b"RBXH amazon metadata" + b"<roblox!binary animation")
+    replacement = tmp_path / 'replacement.bin'
+    replacement.write_bytes(b'RBXH amazon metadata' + b'<roblox!binary animation')
     stripper = TextureStripper(_Config())
 
-    with patch("fleasion.utils.anim_converter.detect_rig", return_value="R15") as detect_rig:
-        assert stripper._detect_repl_rig(str(replacement)) == "R15"
+    with patch('fleasion.utils.anim_converter.detect_rig', return_value='R15') as detect_rig:
+        assert stripper._detect_repl_rig(str(replacement)) == 'R15'
 
     detect_rig.assert_called_once_with(b'<roblox!binary animation')
 
@@ -287,9 +370,7 @@ def test_reset_rejects_response_from_old_batch(tmp_path):
     assert stripper.check_cdn_request('fts.rbxcdn.com', '/stale-content') is None
 
 
-def test_replacement_precheck_stops_and_backs_off_after_network_failure(
-    tmp_path, monkeypatch
-):
+def test_replacement_precheck_stops_and_backs_off_after_network_failure(tmp_path, monkeypatch):
     class _ReplacementConfig:
         def get_all_replacements(self):
             return {100: 900001, 101: 900002}, set(), {}, {}
