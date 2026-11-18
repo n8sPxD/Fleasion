@@ -8,7 +8,7 @@ Fleasion 可以在 Windows、macOS 和 Linux（Sober）上实时替换 Roblox �
 > 这是 Fleasion 的一个小型兼容性 fork。它在当前 `main` 代码基础上，为较新的 Windows Roblox Player 加入 live TLS splice 与 HTTP/2 支持。实机验证目前集中在 **Phantom Forces**；其他游戏没有系统性测试过。
 
 > [!CAUTION]
-> 这个 fork 的兼容构建发布在它自己的 [Releases](https://github.com/n8sPxD/Fleasion/releases) 页面。官方 Fleasion 项目、官网和社区仍在 [fleasion/Fleasion](https://github.com/fleasion/Fleasion) 与 [fleasion.github.io](https://fleasion.github.io/)。
+> 这个 fork 的兼容构建仅发布 Windows 版本，并发布在它自己的 [Releases](https://github.com/n8sPxD/Fleasion/releases) 页面。官方 Fleasion 项目、官网和社区仍在 [fleasion/Fleasion](https://github.com/fleasion/Fleasion) 与 [fleasion.github.io](https://fleasion.github.io/)。
 
 Fleasion 原作者拥有本应用以及活跃开发中的 `feat/rewrite-ui-v2` 重构工作的功劳。这个 fork 的范围刻意更小：只在较旧的 `main` 代码线上移植少量兼容性改动，供一个小范围用户群使用；它不会替代或掩盖上游正在进行的重写工作。
 

@@ -2,7 +2,7 @@
 > This is a small compatibility fork of Fleasion. It adapts the Windows client path in the current `main` codebase to a recent Roblox Player using live TLS splice and HTTP/2 support. Live validation is currently focused on **Phantom Forces**; other games have not been systematically tested.
 
 > [!CAUTION]
-> Compatibility builds from this fork are published on its [Releases](https://github.com/n8sPxD/Fleasion/releases) page. The official Fleasion project, website, and community remain at [fleasion/Fleasion](https://github.com/fleasion/Fleasion) and [fleasion.github.io](https://fleasion.github.io/).
+> Compatibility builds from this fork are Windows-only and published on its [Releases](https://github.com/n8sPxD/Fleasion/releases) page. The official Fleasion project, website, and community remain at [fleasion/Fleasion](https://github.com/fleasion/Fleasion) and [fleasion.github.io](https://fleasion.github.io/).
 
 The original Fleasion authors deserve the credit for the application and for the active `feat/rewrite-ui-v2` rewrite work. This fork is intentionally narrower: it brings selected compatibility changes to the older `main` codebase for a small group of users while the upstream rewrite continues separately.
 

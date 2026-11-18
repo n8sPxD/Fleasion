@@ -1,30 +1,22 @@
-name: Build Draft Release
+name: Build Windows Draft Release
 
 on:
   workflow_dispatch:
-    inputs:
-      windows_only:
-        description: Build only the Windows package
-        required: false
-        default: false
-        type: boolean
 
 permissions:
   contents: write
 
 jobs:
   build-packages:
-    name: Build packages
+    name: Build Windows package
     uses: ./.github/workflows/build.yml
-    with:
-      windows_only: ${{ inputs.windows_only }}
 
   draft-release:
     name: Create draft release
     needs: build-packages
     runs-on: ubuntu-latest
     steps:
-      - name: Download release assets
+      - name: Download release asset
         uses: actions/download-artifact@v8
         with:
           pattern: Fleasion-v${{ needs.build-packages.outputs.artifact_version }}-*
