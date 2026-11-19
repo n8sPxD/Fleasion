@@ -23,6 +23,7 @@ if TYPE_CHECKING:
 
 type ConnectionSecrets = dict[str, bytes]
 type SecretMap = dict[str, ConnectionSecrets]
+type ConnectionCandidate = tuple[int, ConnectionSecrets]
 
 STRUCT_SIZE = 0x900
 TLS12_STRUCT_SIZE = WINDOWS_OPENSSL_350.minimum_size
@@ -532,9 +533,14 @@ def _scan_handle(
     stop: threading.Event | None,
     wanted: bytes | None,
     client_random: str | None,
-) -> SecretMap:
+    excluded_addresses: set[int] | None = None,
+) -> tuple[SecretMap, ConnectionCandidate | None]:
     found: SecretMap = {}
+    exact_candidate: ConnectionCandidate | None = None
+    excluded = excluded_addresses or set()
     for base, region, offset in _candidates(handle, pid, stop, wanted):
+        if base in excluded:
+            continue
         raw = _read(handle, base, STRUCT_SIZE)
         if len(raw) < STRUCT_SIZE:
             continue
@@ -554,8 +560,9 @@ def _scan_handle(
                 _remember_candidate_address(pid, region, base)
                 _remember_scan_location(pid, region, offset)
                 if client_random is not None and validated[0] == client_random:
+                    exact_candidate = (base, validated[1])
                     break
-    return found
+    return found, exact_candidate
 
 
 def scan(
@@ -600,7 +607,7 @@ def scan(
         module_base, module_end = _module_bounds(handle)
         if not module_base:
             return {}
-        return _scan_handle(
+        secrets, _exact_candidate = _scan_handle(
             handle,
             pid,
             module_base,
@@ -609,5 +616,62 @@ def scan(
             wanted=wanted,
             client_random=client_random,
         )
+        return secrets
+    finally:
+        _win32.CloseHandle(handle)
+
+
+def scan_connection_candidate(
+    pid: int,
+    *,
+    stop: threading.Event | None = None,
+    client_random: str,
+    exclude_addresses: set[int],
+) -> ConnectionCandidate | None:
+    """Scan for one exact connection key candidate not already rejected.
+
+    Parameters
+    ----------
+    pid : int
+        Target process identifier.
+    stop : threading.Event, optional
+        Cancellation event to abort memory scanning early.
+    client_random : str
+        Exact 32-byte client random in hex.
+    exclude_addresses : set[int]
+        Previously validated candidate addresses to ignore.
+
+    Returns
+    -------
+    ConnectionCandidate | None
+        Candidate address and secrets, or None when no new candidate exists.
+    """
+    try:
+        wanted = bytes.fromhex(client_random)
+    except ValueError:
+        return None
+    if len(client_random) != 64 or len(wanted) != 32:
+        return None
+    if not _win32.available:
+        return None
+
+    handle: int = _win32.OpenProcess(PROCESS_QUERY_INFORMATION | PROCESS_VM_READ, 0, pid)
+    if not handle:
+        return None
+    try:
+        module_base, module_end = _module_bounds(handle)
+        if not module_base:
+            return None
+        _secrets, candidate = _scan_handle(
+            handle,
+            pid,
+            module_base,
+            module_end,
+            stop=stop,
+            wanted=wanted,
+            client_random=client_random,
+            excluded_addresses=exclude_addresses,
+        )
+        return candidate
     finally:
         _win32.CloseHandle(handle)

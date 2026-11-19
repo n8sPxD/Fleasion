@@ -32,6 +32,11 @@ KEY_UPDATE = 24
 HELLO_PREFIX_SIZE = 35
 SNI_PREFIX_SIZE = 5
 _HTTP_DRAIN_GRACE_SECONDS = 1.0
+_MAX_KEY_CANDIDATE_RETRIES = 8
+
+
+class _TLSKeyCandidateError(ValueError):
+    """Every validated TLS key candidate failed record authentication."""
 
 
 def _server_name(hello: bytes) -> str:
@@ -292,6 +297,70 @@ class SpliceConnection:
             direction.handshake_keys = TrafficKeys(handshake, self.cipher)
             direction.handshake_keys.sequence = direction.handshake_sequence
 
+    async def _use_next_key_candidate(self, direction: _Direction) -> bool:
+        """Replace a rejected key candidate before any plaintext is processed."""
+        if self._http_started or any(self._plain_bytes.values()):
+            return False
+        if not await self.keys.reject_candidate(self.client_random):
+            return False
+
+        for stale_direction in (self.client, self.server):
+            stale_direction.input_keys = None
+            stale_direction.writer.keys = None
+            stale_direction.handshake_keys = None
+        await self._prepare_keys(direction)
+        return (
+            direction.input_keys is not None
+            and direction.writer.keys is not None
+            and direction.handshake_keys is not None
+        )
+
+    async def _decrypt_tls13_record(
+        self, direction: _Direction, record: bytes
+    ) -> tuple[int, bytes, TrafficKeys, TrafficKeys] | None:
+        incoming = direction.input_keys
+        outgoing = direction.writer.keys
+        handshake = direction.handshake_keys
+        if not isinstance(incoming, TrafficKeys) or not isinstance(outgoing, TrafficKeys):
+            msg = 'Splice traffic keys were not initialized'
+            raise RuntimeError(msg)
+        if not isinstance(handshake, TrafficKeys):
+            msg = 'Missing TLS 1.3 handshake keys'
+            raise RuntimeError(msg)
+
+        try:
+            return (*incoming.decrypt(record), incoming, outgoing)
+        except InvalidTag:
+            try:
+                handshake.decrypt(record)
+                return None
+            except InvalidTag:
+                pass
+
+        for _retry in range(_MAX_KEY_CANDIDATE_RETRIES):
+            if not await self._use_next_key_candidate(direction):
+                raise _TLSKeyCandidateError
+            incoming = direction.input_keys
+            outgoing = direction.writer.keys
+            handshake = direction.handshake_keys
+            if not isinstance(incoming, TrafficKeys) or not isinstance(outgoing, TrafficKeys):
+                msg = 'Replacement TLS traffic keys were not initialized'
+                raise RuntimeError(msg)
+            if not isinstance(handshake, TrafficKeys):
+                msg = 'Replacement TLS handshake keys were not initialized'
+                raise RuntimeError(msg)
+
+            try:
+                return (*incoming.decrypt(record), incoming, outgoing)
+            except InvalidTag:
+                try:
+                    handshake.decrypt(record)
+                    return None
+                except InvalidTag:
+                    continue
+
+        raise _TLSKeyCandidateError
+
     async def _tls12_record(self, direction: _Direction, record: bytes) -> bool:
         """Relay the clear handshake and decrypt post-CCS TLS 1.2 records."""
         kind = record[0]
@@ -372,16 +441,17 @@ class SpliceConnection:
                     await direction.wire.drain()
                     return True
                 raise
-        incoming = direction.input_keys
-        outgoing = direction.writer.keys
-        handshake = direction.handshake_keys
-        if incoming is None or outgoing is None or (not is_tls12 and handshake is None):
-            msg = 'Splice traffic keys were not initialized'
-            raise RuntimeError(msg)
-        try:
-            content_type, content = incoming.decrypt(record)
-        except InvalidTag:
-            if is_tls12:
+        if is_tls12:
+            incoming = direction.input_keys
+            outgoing = direction.writer.keys
+            if not isinstance(incoming, TLS12RecordCipher) or not isinstance(
+                outgoing, TLS12RecordCipher
+            ):
+                msg = 'Splice traffic keys were not initialized'
+                raise RuntimeError(msg)
+            try:
+                content_type, content = incoming.decrypt(record)
+            except InvalidTag:
                 if not self._tls12_authenticated_application:
                     if self.require_interception:
                         msg = 'Required TLS interception rejected unverified TLS 1.2 master secret'
@@ -397,18 +467,20 @@ class SpliceConnection:
                     return True
                 msg = 'TLS 1.2 record failed authentication after interception began'
                 raise ValueError(msg) from None
-            # A fragmented client Finished may occupy more than one record
-            if handshake is None:
-                msg = 'Missing TLS 1.3 handshake keys'
-                raise RuntimeError(msg) from None
+        else:
             try:
-                handshake.decrypt(record)
-            except InvalidTag:
-                msg = 'TLS record failed authentication with the validated connection keys'
-                raise ValueError(msg) from None
-            direction.wire.write(record)
-            await direction.wire.drain()
-            return True
+                decrypted = await self._decrypt_tls13_record(direction, record)
+            except _TLSKeyCandidateError as exc:
+                msg = (
+                    'TLS record failed authentication with every validated connection key candidate'
+                )
+                raise ValueError(msg) from exc
+            if decrypted is None:
+                # A fragmented client Finished may occupy more than one record
+                direction.wire.write(record)
+                await direction.wire.drain()
+                return True
+            content_type, content, incoming, outgoing = decrypted
         if direction is self.client:
             await self._prepare_keys(self.server)
             self._application_ready.set()
@@ -587,6 +659,7 @@ class SpliceConnection:
             # Close wires before awaiting cancelled children
             for direction in (self.client, self.server):
                 direction.wire.close()
+            self.keys.forget(self.client_random)
             for task in [*pumps, http]:
                 task.cancel()
             await asyncio.gather(*pumps, http, return_exceptions=True)
