@@ -661,6 +661,16 @@ def _log_upstream_transport_settings(
     )
 
 
+def _upstream_mode_with_proxy_fallback(
+    effective_mode: str,
+    system_http_proxy: Optional[HttpProxyConfig],
+) -> str:
+    """Fall back to auto transport when System Proxy has no detected proxy."""
+    if effective_mode == UpstreamMode.SYSTEM_PROXY.value and system_http_proxy is None:
+        return UpstreamMode.AUTO.value
+    return effective_mode
+
+
 def _manual_http_proxy_from_settings(config_manager) -> Optional[HttpProxyConfig]:
     host = str(getattr(config_manager, 'upstream_http_connect_host', '') or '').strip()
     port = int(getattr(config_manager, 'upstream_http_connect_port', 0) or 0)
@@ -5686,7 +5696,17 @@ class ProxyMaster:
         manual_http_proxy = _manual_http_proxy_from_settings(self.config_manager)
         manual_socks5_proxy = _manual_socks5_proxy_from_settings(self.config_manager)
         configured_upstream_mode = self.config_manager.upstream_transport_mode
-        effective_upstream_mode = self._effective_upstream_mode()
+        requested_upstream_mode = self._effective_upstream_mode()
+        effective_upstream_mode = _upstream_mode_with_proxy_fallback(
+            requested_upstream_mode,
+            system_http_proxy,
+        )
+        if effective_upstream_mode != requested_upstream_mode:
+            log_buffer.log(
+                'ProxyDiag',
+                'System Proxy transport was selected but no system HTTP proxy is detected; '
+                'using auto/direct transport instead',
+            )
         asset_connection_limit = self.config_manager.vpn_compat_max_assetdelivery_connections
         cdn_connection_limit = self.config_manager.vpn_compat_max_cdn_connections
         _log_upstream_transport_settings(

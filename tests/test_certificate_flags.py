@@ -219,6 +219,20 @@ def test_windows_splice_transport_can_be_disabled_by_environment(
     assert not proxy._use_splice_transport()  # pyright: ignore[reportPrivateUsage]
 
 
+def test_system_proxy_falls_back_to_auto_without_detected_proxy() -> None:
+    from fleasion.proxy.upstream import HttpProxyConfig
+
+    assert proxy_master._upstream_mode_with_proxy_fallback('system_proxy', None) == 'auto'
+    assert (
+        proxy_master._upstream_mode_with_proxy_fallback(
+            'system_proxy',
+            HttpProxyConfig(host='127.0.0.1', port=8080),
+        )
+        == 'system_proxy'
+    )
+    assert proxy_master._upstream_mode_with_proxy_fallback('direct_ip', None) == 'direct_ip'
+
+
 def test_windows_splice_startup_skips_legacy_certificate_probe(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
