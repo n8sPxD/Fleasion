@@ -5346,6 +5346,11 @@ class ProxyMaster:
     ) -> None:
         loop = getattr(self, '_loop', None)
         accept_fault = bool(getattr(self, '_windows_proactor_accept_fault', False))
+        attempts = getattr(self, '_tls_startup_attempts', None) or []
+        if any(str(attempt.get('mode') or '').startswith('splice') for attempt in attempts):
+            # Splice probes validate upstream transport, not the asyncio TLS
+            # listener, so a Proactor retry cannot change their result
+            return
         if (
             not IS_WINDOWS
             or loop is None

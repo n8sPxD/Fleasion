@@ -333,3 +333,25 @@ def test_sober_arms_delayed_interception_with_custom_flags_off(
         assert armed.wait(timeout=1.0)
     finally:
         proxy._stop_linux_sober_custom_fflag_timer()  # pyright: ignore[reportPrivateUsage]
+
+
+def test_splice_probe_failure_skips_selector_retry(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(proxy_master, 'IS_WINDOWS', True)
+
+    class _FakeProactorEventLoop:
+        pass
+
+    proxy = proxy_master.ProxyMaster.__new__(proxy_master.ProxyMaster)
+    proxy._loop = _FakeProactorEventLoop()
+    proxy._tls_startup_attempts = [{'mode': 'splice_connect', 'ok': False}]
+    proxy._proxy = SimpleNamespace()
+
+    result = asyncio.run(
+        proxy._raise_selector_retry_for_proactor_tls_failure(  # pyright: ignore[reportPrivateUsage]
+            raw_tls_probe_ok=True
+        )
+    )
+
+    assert result is None
