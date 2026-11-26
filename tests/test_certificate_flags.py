@@ -266,6 +266,40 @@ def test_windows_splice_startup_skips_legacy_certificate_probe(
     assert any('Startup TLS splice transport probe passed' in message for _, message in logs)
 
 
+def test_windows_splice_startup_uses_tls_probe_for_hosts_mode(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(proxy_master, 'IS_WINDOWS', True)
+    calls: list[str] = []
+
+    async def connect_probe(_hosts: set[str], _port: int) -> tuple[bool, list[str]]:
+        calls.append('connect')
+        return True, []
+
+    async def tls_probe(_hosts: set[str], _port: int) -> tuple[bool, list[str]]:
+        calls.append('tls')
+        return True, []
+
+    monkeypatch.setattr(proxy_master, '_splice_connect_probe_result', connect_probe)
+    monkeypatch.setattr(proxy_master, '_splice_tls_probe_result', tls_probe)
+    proxy = proxy_master.ProxyMaster.__new__(proxy_master.ProxyMaster)
+    proxy._proxy = SimpleNamespace(_tls_splice=True)
+    proxy._tls_startup_attempts = []
+
+    result = asyncio.run(
+        proxy._run_startup_tls_self_test(  # pyright: ignore[reportPrivateUsage]
+            {'gamejoin.roblox.com'},
+            Path('.'),
+            443,
+            explicit_proxy=False,
+        )
+    )
+
+    assert result
+    assert calls == ['tls']
+    assert proxy._tls_startup_attempts[0]['mode'] == 'splice_tls'  # pyright: ignore[reportPrivateUsage]
+
+
 def test_sober_arms_delayed_interception_with_custom_flags_off(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

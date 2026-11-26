@@ -845,16 +845,43 @@ def _probe_splice_route_sync(host: str, port: int) -> None:
             raise OSError(f'splice probe CONNECT failed: {status_line!r}')
 
 
-async def _splice_connect_probe_result(hosts: set[str], port: int) -> tuple[bool, list[str]]:
-    """Probe explicit splice routes while allowing each upstream call to finish."""
+def _probe_splice_tls_route_sync(host: str, port: int) -> None:
+    """Verify that a hosts-mode splice route can complete a TLS handshake."""
+    context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+    context.check_hostname = False
+    context.verify_mode = ssl.CERT_NONE
+    context.minimum_version = ssl.TLSVersion.TLSv1_2
+    with socket.create_connection(('127.0.0.1', port), timeout=5.0) as raw_socket:
+        raw_socket.settimeout(15.0)
+        with context.wrap_socket(raw_socket, server_hostname=host) as tls_socket:
+            if not tls_socket.version():
+                raise OSError('splice probe TLS handshake returned no protocol')
+
+
+async def _splice_probe_result(
+    hosts: set[str],
+    port: int,
+    probe: Callable[[str, int], None],
+) -> tuple[bool, list[str]]:
+    """Probe splice routes while allowing each upstream call to finish."""
     loop = asyncio.get_running_loop()
     failures: list[str] = []
     for host in sorted(hosts):
         try:
-            await loop.run_in_executor(None, _probe_splice_route_sync, host, port)
+            await loop.run_in_executor(None, probe, host, port)
         except Exception as exc:
             failures.append(f'{host}={type(exc).__name__}: {exc}')
     return not failures, failures
+
+
+async def _splice_connect_probe_result(hosts: set[str], port: int) -> tuple[bool, list[str]]:
+    """Probe explicit splice routes through the HTTP CONNECT listener."""
+    return await _splice_probe_result(hosts, port, _probe_splice_route_sync)
+
+
+async def _splice_tls_probe_result(hosts: set[str], port: int) -> tuple[bool, list[str]]:
+    """Probe hosts-mode splice routes through a TLS ClientHello."""
+    return await _splice_probe_result(hosts, port, _probe_splice_tls_route_sync)
 
 
 def _run_raw_tls_loopback_probe_sync(
@@ -5189,11 +5216,16 @@ class ProxyMaster:
             return True
 
         if getattr(self._proxy, '_tls_splice', False):
-            ok, failures = await _splice_connect_probe_result(hosts, port)
+            if explicit_proxy:
+                ok, failures = await _splice_connect_probe_result(hosts, port)
+                probe_mode = 'splice_connect'
+            else:
+                ok, failures = await _splice_tls_probe_result(hosts, port)
+                probe_mode = 'splice_tls'
             self._tls_startup_attempts = [
                 {
                     'loopback': '127.0.0.1',
-                    'mode': 'splice_connect',
+                    'mode': probe_mode,
                     'ok': ok,
                     'failures': failures,
                 }
@@ -5208,7 +5240,8 @@ class ProxyMaster:
                 'TLS',
                 'Startup TLS splice transport probe passed for '
                 f'{format_count(hosts, "intercept host")} '
-                '(CONNECT/upstream only; live client traffic is required to test decryption)',
+                f'({"CONNECT" if explicit_proxy else "ClientHello"}/upstream only; '
+                'live client traffic is required to test decryption)',
             )
             return True
 
