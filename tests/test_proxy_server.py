@@ -109,6 +109,27 @@ def test_upstream_self_test_serializes_and_fully_closes_probes():
     ]
 
 
+def test_transport_configuration_error_does_not_emit_firewall_failure():
+    proxy = FleasionProxy.__new__(FleasionProxy)
+    calls = []
+    proxy._upstream_connect_failure_notified = False
+    proxy._on_upstream_connect_failure = lambda host, error: calls.append((host, error))
+
+    proxy._notify_upstream_connect_failure_once(
+        'assetdelivery.roblox.com',
+        'no system HTTP proxy detected',
+    )
+
+    assert calls == []
+
+    proxy._notify_upstream_connect_failure_once(
+        'assetdelivery.roblox.com',
+        'direct_ip: TimeoutError',
+    )
+
+    assert calls == [('assetdelivery.roblox.com', 'direct_ip: TimeoutError')]
+
+
 def test_explicit_tunnel_prefers_system_http_connect(monkeypatch):
     calls = []
 

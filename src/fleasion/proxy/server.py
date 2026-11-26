@@ -554,6 +554,16 @@ def _format_exc(exc: Exception) -> str:
     return f'{type(exc).__name__}: {text}' if text else type(exc).__name__
 
 
+def _is_transport_configuration_error(error: str) -> bool:
+    """Whether an upstream failure comes from proxy settings rather than the network."""
+    text = (error or '').lower()
+    return (
+        'no system http proxy detected' in text
+        or 'http connect proxy is not configured' in text
+        or 'socks5 proxy is not configured' in text
+    )
+
+
 @dataclass
 class _ExplicitTunnelConnectResult:
     reader: Optional[asyncio.StreamReader]
@@ -1378,6 +1388,9 @@ class FleasionProxy:
             logger.debug(message)
 
     def _notify_upstream_connect_failure_once(self, host: str, error: str) -> None:
+        if _is_transport_configuration_error(error):
+            # A missing proxy configuration is a settings error, not a firewall block
+            return
         if self._upstream_connect_failure_notified or self._on_upstream_connect_failure is None:
             return
         self._upstream_connect_failure_notified = True
