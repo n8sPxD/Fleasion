@@ -196,14 +196,16 @@ def test_windows_routes_clientsettings_before_launch_with_user_flags_off(
         SimpleNamespace(custom_fflags_enabled=False, custom_fflags={}),
     )
     hosts = proxy._desired_intercept_hosts()  # pyright: ignore[reportPrivateUsage]
-    assert 'assetdelivery.roblox.com' in hosts
-    assert 'clientsettings.roblox.com' not in hosts
-    assert 'clientsettingscdn.roblox.com' not in hosts
+    assert {
+        'assetdelivery.roblox.com',
+        'clientsettings.roblox.com',
+        'clientsettingscdn.roblox.com',
+    } <= hosts
     proxy._log_intercept_configuration(  # pyright: ignore[reportPrivateUsage]
         'Windows compatibility',
         hosts,
     )
-    assert 'custom_fflags=disabled; clientsettings_intercepted=no' in logs[-1][1]
+    assert 'custom_fflags=disabled; clientsettings_intercepted=yes' in logs[-1][1]
 
 
 def test_windows_splice_transport_can_be_disabled_by_environment(

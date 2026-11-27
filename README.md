@@ -103,11 +103,11 @@ Env Proxy runs the Fleasion app and proxy as your normal user on every platform.
 <details>
 <summary><b>Certificates and FastFlags</b></summary>
 
-Windows uses the live TLS splice transport: Roblox keeps its original certificate chain, Fleasion recovers only the local process's TLS session keys, and ClientSettings remains an end-to-end tunnel so its response signature is preserved. Other platforms set `DFFlagHttpUseEmbeddedCaCerts=False` so Roblox trusts the patched `ssl/cacert.pem` bundle, and receive that override with its refresh interval through ClientSettings responses even when custom FastFlags are off.
+Windows uses the live TLS splice transport: Roblox keeps its original certificate chain and Fleasion recovers only the local process's TLS session keys, so ClientSettings responses are modified in flight like on every other platform. Other platforms set `DFFlagHttpUseEmbeddedCaCerts=False` so Roblox trusts the patched `ssl/cacert.pem` bundle. On every platform the compatibility override and its refresh interval arrive through ClientSettings responses even when custom FastFlags are off.
 
 Sober's pinned bootstrap requests stay tunneled, and Linux interception starts after Sober's existing bootstrap delay. These internal overrides do not appear in your saved FastFlag list, and certificate verification stays on.
 
-When custom FastFlags are on, Windows pre-fills its startup flag cache; other platforms also merge overrides into ClientSettings responses. This keeps flags that Roblox reads early in startup available immediately. Windows dynamic ClientSettings overrides remain disabled while Roblox verifies signed responses.
+When custom FastFlags are on, Windows also pre-fills its startup flag cache, and every platform merges overrides into ClientSettings responses. This keeps flags that Roblox reads early in startup available immediately, and live edits reach a running Player through its next refresh.
 
 </details>
 
