@@ -4511,7 +4511,6 @@ class ProxyMaster:
         if (
             custom_modifier is not None
             and custom_modifier.is_enabled()
-            and not IS_WINDOWS
             and self._linux_sober_custom_fflag_routes_ready()
         ):
             hosts.update(CUSTOM_FFLAGS_INTERCEPT_HOSTS)

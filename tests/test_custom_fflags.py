@@ -838,7 +838,7 @@ def test_dcz_round_trip_uses_the_client_dictionary_and_extracts_its_hash():
     assert _dcz_dictionary_sha256('/v2/client-version/WindowsPlayer') is None
 
 
-def test_windows_tunnels_clientsettings_to_preserve_signed_responses(monkeypatch):
+def test_windows_routes_clientsettings_through_the_intercept_set(monkeypatch):
     monkeypatch.setattr(proxy_master, 'IS_WINDOWS', True)
 
     proxy = proxy_master.ProxyMaster.__new__(proxy_master.ProxyMaster)
@@ -848,8 +848,7 @@ def test_windows_tunnels_clientsettings_to_preserve_signed_responses(monkeypatch
     proxy._roblox_player_running = False
 
     hosts = proxy._desired_intercept_hosts()
-    assert hosts == set(BASE_INTERCEPT_HOSTS)
-    assert not hosts & CUSTOM_FFLAGS_INTERCEPT_HOSTS
+    assert hosts == set(BASE_INTERCEPT_HOSTS) | set(CUSTOM_FFLAGS_INTERCEPT_HOSTS)
 
 
 def test_master_primes_custom_flag_cache_only_while_player_is_closed(monkeypatch):
